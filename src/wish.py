@@ -4,24 +4,62 @@ import sys
 import ast
 import time
 import operator
+import platform
 import traceback
 import collections
 
 
 class Config(object):
-    VERBOSE = "+"
-    PLATFORM_KEY = "platform"
+    VERBOSE = "-"
     PACKAGE_NAME = "package.py"
+
+    class Platform(object):
+        _platform_dict = None
+
+        def __new__(cls):
+            if cls._platform_dict is None:
+                native_platform = sys.platform
+                native_arch = platform.machine()
+                if native_platform == "win32":
+                    alias_platform = "windows"
+                elif native_platform == "darwin":
+                    alias_platform = "macos"
+                elif native_platform.startswith("linux"):
+                    alias_platform = "linux"
+                elif native_platform.startswith("freebsd"):
+                    alias_platform = "freebsd"
+                else:
+                    alias_platform = native_platform
+
+                if native_arch in ("AMD64", "x86_64"):
+                    alias_arch = "x86_64"
+                elif native_arch in ("aarch64", "ARM64"):
+                    alias_arch = "arm64"
+                elif native_arch in ("i386", "i686", "x86"):
+                    alias_arch = "x86"
+                else:
+                    alias_arch = native_arch
+                cls._platform_dict = {
+                    "platform": {native_platform, alias_platform},
+                    "arch": {native_arch, alias_arch},
+                    "release": {platform.release()},
+                }
+            return cls._platform_dict
 
     class Env(object):
         ALIAS_PREFIX = "WISH_ALIAS_"
         RESTAPI_URL = "WISH_RESTAPI_URL"
         STORAGE_URL = "WISH_STORAGE_URL"
+
         PACKAGE_ROOT = "WISH_PACKAGE_ROOT"
         PACKAGE_PATH = "WISH_PACKAGE_PATH"
         STORAGE_PATH = "WISH_STORAGE_PATH"
         DEVELOP_PATH = "WISH_DEVELOP_PATH"
-        PACKAGE_MODE = "WISH_PACKAGE_MODE"
+
+        LOCK_MODE = "WISH_LOCK_MODE"
+        DEVELOP_MODE = "WISH_DEVELOP_MODE"
+        OFFLINE_MODE = "WISH_OFFLINE_MODE"
+
         PACKAGE_EXTRA = "WISH_PACKAGE_EXTRA"
 
     class Msg(object):
@@ -47,11 +85,13 @@ class Config(object):
                     "Path: {}\n"
                     "Details: {}\n"
                     "Package defined specific keywords and modules\n"
+                    "ban: Block with specific package\n"
                     "req: Require with specific packages\n"
                     "ext: extended with specific packages\n"
                     "ava: Available with specific packages\n"
+                    "alt: Alternative with specific package\n"
+                    "xor: Exclusive OR with specific packages\n"
                     "env: Environment variable operation module\n"
-                    "ban: Block with specific package\n"
                     "alias: Alias for command\n"
                     "this: Information about current package, "
                     "including this.name, this.tags, this.root, this.init etc.\n"
@@ -77,15 +117,21 @@ class Config(object):
                 "message": (
                     "Error: Cannot resolve {} conditions\n"
                     "Please check requested package exists or package request conditions are met\n"
-                    "resolve info:\n{}\n"
+                ),
+            },
+            "PENDING_ERROR": {
+                "code": 6,
+                "message": (
+                    "Error: Failed to auto-activate extension package '{}'\n"
+                    "The extension package could not be resolved or its activation conditions were not met.\n"
+                    "Please check if the extension conditions or the main package environment are correct.\n"
+                    "Extension request info:\n{}\n"
                 ),
             },
             "UNDEFINED": {
                 "code": 255,
                 "message": (
-                    "Error: Undefined error type\n"
-                    "Error code: {}\n"
-                    "This may be a bug, please report this issue\n"
+                    "Error: Undefined error type\n" "Error code: {}\n" "This may be a bug, please report this issue\n"
                 ),
             },
         }
@@ -172,13 +218,23 @@ class Extractor(ast.NodeTransformer):
 
 class Thispath(object):
     def __init__(self, path, env=False, init=False):
-        plist = path.split(os.sep)
         self.init = init
-        self.name = plist[-3]
-        self.tags = plist[-2]
+        plist = path.split(os.sep)
         self.root = os.path.dirname(path)
+        if self.part(path):
+            self.name = plist[-3]
+            self.tags = plist[-2]
+        else:
+            self.name = plist[-2]
+            self.tags = None
         if env:
             Environ(Config.Env.PACKAGE_ROOT).append(self.root)
+
+    def part(self, path):
+        third_partys = Environ(Config.Env.PACKAGE_PATH).envlist()
+        for party in third_partys:
+            if path.startswith(party):
+                return True
 
     def envs(self, name):
         tags_dict = dict()
@@ -206,6 +262,9 @@ class Nickname(object):
 
 
 class Resolve(object):
+    _MIN_V = object()
+    _MAX_V = object()
+
     def __init__(self):
         self.operators = {
             "==": operator.eq,
@@ -219,6 +278,8 @@ class Resolve(object):
             "req": dict(),
             "ava": dict(),
             "ban": dict(),
+            "alt": dict(),
+            "xor": dict(),
         }
         self.package_state = {
             "init": list(),
@@ -229,6 +290,7 @@ class Resolve(object):
         self.package_graph = {
             "graphed": collections.OrderedDict(),
             "visited": collections.OrderedDict(),
+            "pending": collections.OrderedDict(),
         }
 
     def safe_open(self, path):
@@ -291,9 +353,7 @@ class Resolve(object):
         if prioriy:
             return [prioriy[-1]]
         flag_order = (">=", "<=", "!=", ">", "<", "=")
-        prioriy = [
-            (flag, tags, path) for (flag, tags, path) in clist if flag in flag_order
-        ]
+        prioriy = [(flag, tags, path) for (flag, tags, path) in clist if flag in flag_order]
         if prioriy:
             return prioriy
         prioriy = [(flag, tags, path) for (flag, tags, path) in clist if flag is None]
@@ -323,21 +383,99 @@ class Resolve(object):
         for char in tags:
             if char.isdigit():
                 if current_str:
-                    processed_parts.append(current_str)
+                    processed_parts.append((0, current_str))
                     current_str = ""
                 current_num += char
             else:
                 if current_num:
-                    processed_parts.append(int(current_num))
+                    processed_parts.append((1, int(current_num)))
                     current_num = ""
                 current_str += char
 
         if current_num:
-            processed_parts.append(int(current_num))
+            processed_parts.append((1, int(current_num)))
         if current_str:
-            processed_parts.append(current_str)
-
+            processed_parts.append((0, current_str))
         return processed_parts
+
+    def calculate_prefix_key(self, version_key):
+        key_copy = list(version_key)
+        for i in range(len(key_copy) - 1, -1, -1):
+            part_type, part_value = key_copy[i]
+            if part_type == 1:
+                key_copy[i] = (1, part_value + 1)
+                return key_copy[: i + 1]
+        return self._MAX_V
+
+    def convert_rule(self, rule):
+        flag, version_str, _ = rule
+        try:
+            version = self.version_key(version_str)
+        except (ValueError, TypeError):
+            return (self._MIN_V, self._MAX_V, True, True)
+
+        if flag == "==":
+            return (version, version, True, True)
+        elif flag == "=":
+            return (version, self.calculate_prefix_key(version), True, False)
+        elif flag == ">=":
+            return (version, self._MAX_V, True, True)
+        elif flag == ">":
+            return (version, self._MAX_V, False, True)
+        elif flag == "<=":
+            return (self._MIN_V, version, True, True)
+        elif flag == "<":
+            return (self._MIN_V, version, True, False)
+        elif flag == "!=":
+            return ("not", version)
+        return (self._MIN_V, self._MAX_V, True, True)
+
+    def calculate_interval(self, int1, int2):
+        l1, u1, li1, ui1 = int1
+        l2, u2, li2, ui2 = int2
+
+        if l1 is self._MIN_V:
+            new_lower, new_lower_incl = l2, li2
+        elif l2 is self._MIN_V:
+            new_lower, new_lower_incl = l1, li1
+        else:
+            if l1 > l2:
+                new_lower, new_lower_incl = l1, li1
+            elif l2 > l1:
+                new_lower, new_lower_incl = l2, li2
+            else:
+                new_lower, new_lower_incl = l1, li1 and li2
+
+        if u1 is self._MAX_V:
+            new_upper, new_upper_incl = u2, ui2
+        elif u2 is self._MAX_V:
+            new_upper, new_upper_incl = u1, ui1
+        else:
+            if u1 < u2:
+                new_upper, new_upper_incl = u1, ui1
+            elif u2 < u1:
+                new_upper, new_upper_incl = u2, ui2
+            else:
+                new_upper, new_upper_incl = u1, ui1 and ui2
+
+        if new_lower is not self._MIN_V and new_upper is not self._MAX_V:
+            if new_lower > new_upper:
+                return None
+            if new_lower == new_upper and not (new_lower_incl and new_upper_incl):
+                return None
+        return (new_lower, new_upper, new_lower_incl, new_upper_incl)
+
+    def rules_compatible(self, rules1, rules2):
+        all_range_rules = [r for r in rules1 if r[0] != "!="] + [r for r in rules2 if r[0] != "!="]
+        final_interval = (self._MIN_V, self._MAX_V, True, True)
+        for rule in all_range_rules:
+            rule_interval = self.convert_rule(rule)
+            if rule_interval[0] == "not":
+                continue
+            final_interval = self.calculate_interval(final_interval, rule_interval)
+            if final_interval is None:
+                return False
+        return final_interval is not None
 
     def resolve_tags(self, flag, tags, tags_list):
         filter_list = list()
@@ -353,17 +491,15 @@ class Resolve(object):
             return filter_list
         parsed_tags_list = [self.version_key(t) for t in tags_list]
         if flag == "=":
-            filter_list = [
-                tags_list[i]
-                for i, t in enumerate(parsed_tags_list)
-                if t[: len(parsed_tags)] == parsed_tags
-            ]
+            for i, t in enumerate(parsed_tags_list):
+                if t[0][0] == 0 and parsed_tags[0][0] == 0:
+                    if t[0][1].startswith(parsed_tags[0][1]) and t[1 : len(parsed_tags)] == parsed_tags[1:]:
+                        filter_list.append(tags_list[i])
+                else:
+                    if t[: len(parsed_tags)] == parsed_tags:
+                        filter_list.append(tags_list[i])
         else:
-            filter_list = [
-                tags_list[i]
-                for i, t in enumerate(parsed_tags_list)
-                if self.operators[flag](t, parsed_tags)
-            ]
+            filter_list = [tags_list[i] for i, t in enumerate(parsed_tags_list) if self.operators[flag](t, parsed_tags)]
         return filter_list
 
     def match_ranges(self, tags_list, cons):
@@ -390,7 +526,7 @@ class Resolve(object):
         valid_groups = list()
         current_group = list()
         for condition in cons:
-            op = condition[1]
+            op = condition[0]
             if op in [">", ">="]:
                 if current_group:
                     valid_groups.append(current_group)
@@ -403,85 +539,23 @@ class Resolve(object):
             valid_groups.append(current_group)
         return valid_groups
 
-    def build_info(self, name):
-        def get_version_info(pkg_name):
-            if pkg_name not in self.package_graph.get("graphed", {}):
-                return None, []
-            available_vers = sorted(
-                list(self.package_graph["graphed"][pkg_name].keys())
-            )
-            current_ver = None
-            if (
-                pkg_name in self.package_graph.get("visited", {})
-                and self.package_graph["visited"][pkg_name]
-            ):
-                current_ver = self.package_graph["visited"][pkg_name][-1]
-            else:
-                current_ver = available_vers[-1] if available_vers else None
-            return current_ver, available_vers
-
-        def analyze_failure(pkg_name, version):
-            if not version:
-                return []
-
-            reasons = []
-            pkg_info = self.package_graph["graphed"][pkg_name][version]
-
-            if "ava" in pkg_info:
-                for req in pkg_info["ava"]:
-                    req_name = self.resolve_argv(req)[0]
-                    if req_name != Config.PLATFORM_KEY:
-                        if (
-                            req_name not in self.package_graph.get("visited", {})
-                            or not self.package_graph["visited"][req_name]
-                        ):
-                            reasons.append("Availability requirement not met: %s" % req)
-            if "req" in pkg_info:
-                for req in pkg_info["req"]:
-                    req_name = self.resolve_argv(req)[0]
-                    if req_name not in self.package_graph.get("graphed", {}):
-                        reasons.append("Required package not found: %s" % req)
-                    elif (
-                        req_name not in self.package_graph.get("visited", {})
-                        or not self.package_graph["visited"][req_name]
-                    ):
-                        reasons.append(("dep", req_name, req))
-            return reasons
-
-        def build_tree(pkg_name, prefix="", visited=None):
-            if visited is None:
-                visited = set()
-            visited.add(pkg_name)
-            ver, _ = get_version_info(pkg_name)
-            lines = ["%s%s (%s)" % (prefix, pkg_name, ver or None)]
-            if (
-                pkg_name not in self.package_graph.get("visited", {})
-                or not self.package_graph["visited"][pkg_name]
-            ):
-                reasons = analyze_failure(pkg_name, ver)
-                next_prefix = prefix + "  "
-
-                for reason in reasons:
-                    if isinstance(reason, tuple) and reason[0] == "dep":
-                        _, dep_name, req = reason
-                        lines.extend(
-                            build_tree(dep_name, next_prefix + "└─ ", visited.copy())
-                        )
-                        lines.append("%s   req(%s)" % (next_prefix, req))
-                    else:
-                        lines.append("%s%s" % (next_prefix, reason))
-
-            return lines
-
-        return "\n".join(build_tree(name))
-
 
 class Acquire(Resolve):
     def __init__(self):
         super(Acquire, self).__init__()
         self.syncer = None
+        self.solver = None
 
-    def parse_argv(self, path, argv):
+    def parse_docs(self, path):
+        if self.safe_exists(path):
+            try:
+                tree = ast.parse(self.safe_open(path))
+                return ast.get_docstring(tree)
+            except Exception:
+                err = "".join(traceback.format_exception(*sys.exc_info()))
+                Config.Msg.error("CONFIG_ERROR", path, err)
+
+    def parse_argv(self, path, argv, extend=True):
         result = list()
 
         if self.safe_exists(path):
@@ -490,7 +564,10 @@ class Acquire(Resolve):
                 extractor = Extractor(argv)
                 extractor.visit(tree)
                 for call in extractor.calls:
-                    result.extend([ast.literal_eval(arg) for arg in call.args])
+                    if extend:
+                        result.extend([ast.literal_eval(arg) for arg in call.args])
+                    else:
+                        result.append([ast.literal_eval(arg) for arg in call.args])
             except Exception:
                 err = "".join(traceback.format_exception(*sys.exc_info()))
                 Config.Msg.error("CONFIG_ERROR", path, err)
@@ -498,7 +575,10 @@ class Acquire(Resolve):
             this = Thispath(path)
             name, tags = this.name, this.tags
             if self.syncer:
-                result.extend(self.syncer.get_args(name, tags, argv))
+                if extend:
+                    result.extend(self.syncer.get_args(name, tags, argv))
+                else:
+                    result.append(self.syncer.get_args(name, tags, argv))
             else:
                 Config.Msg.error("NETWORK_ERROR", argv, name, tags)
         return result
@@ -560,71 +640,61 @@ class Acquire(Resolve):
                         resolve_dict[tag] = [path]
         return resolve_dict
 
-    def resolve_filter(self, name, tags, key, key_filter):
+    def resolve_filter(self, name, tags, key):
         resolve_dict = dict()
+        key_filter = self.filters[key]
+        platform_info = Config.Platform()
         if name in key_filter and tags in key_filter[name]:
             args = key_filter[name][tags]
             pkgs = self.combine_argv([{v: self.resolve_argv(v)} for v in args])
             for kname, kcons in pkgs.items():
-                if kname == Config.PLATFORM_KEY:
+                if kname in platform_info:
+                    if not self.resolve_architecture(kname, kcons, platform_info):
+                        return {kname: list()}
                     continue
                 if kname not in self.package_graph["visited"]:
+                    if key in ("alt",):
+                        resolve_dict[kname] = kcons
+                        continue
                     resolve_dict[kname] = list()
                     continue
                 ktags_list = self.package_graph["visited"][kname]
-                if key in ("req", "ban"):
+                if key in ("req", "ban", "xor"):
                     for kc in kcons:
                         ktags_list = self.resolve_tags(kc[0], kc[1], ktags_list)
-                if key in ("ava"):
+                if key in ("ava",):
                     group_cons = self.group_ranges(kcons)
                     ktags_list = self.match_ranges(ktags_list, group_cons)
                 resolve_dict[kname] = ktags_list
         return resolve_dict
 
-    def recursion_tags(self, name, tags, real_visited):
-        if real_visited.get(name):
-            if tags not in real_visited[name]:
-                real_visited[name].append(tags)
-        else:
-            real_visited[name] = [tags]
-        resolve_req = self.resolve_filter(name, tags, "req", self.filters["req"])
-        for rname, rtags_list in resolve_req.items():
-            if rtags_list:
-                rtags = rtags_list[-1]
-                if real_visited.get(rname):
-                    if rtags in real_visited[rname]:
-                        continue
-                    real_visited[rname].append(rtags)
-                else:
-                    real_visited[rname] = [rtags]
-                self.recursion_tags(rname, rtags, real_visited)
-            else:
-                real_visited[rname] = rtags_list
-        resolve_ava = self.resolve_filter(name, tags, "ava", self.filters["ava"])
-        for aname, atags_list in resolve_ava.items():
-            if atags_list:
-                atags = atags_list[-1]
-                if real_visited.get(aname):
-                    if atags in real_visited[aname]:
-                        continue
-                    real_visited[aname].append(atags)
-                else:
-                    real_visited[aname] = [atags]
-                self.recursion_tags(aname, atags, real_visited)
-            else:
-                real_visited[aname] = atags_list
-
     def update_filter(self, name, tags, key):
+        if name not in self.package_graph["graphed"]:
+            return
         if self.package_graph["graphed"][name][tags][key]:
             if not self.filters[key].get(name):
                 self.filters[key][name] = dict()
             if not self.filters[key][name].get(tags):
                 self.filters[key][name][tags] = list()
-            self.filters[key][name][tags] = self.package_graph["graphed"][name][tags][
-                key
-            ]
+            self.filters[key][name][tags] = self.package_graph["graphed"][name][tags][key]
 
-    def ban_inherit(self, name, tags_list):
+    def build_filter(self, name_list=None):
+        if name_list is None:
+            name_list = list(self.package_graph["visited"].keys())
+        for name in name_list:
+            if name not in self.package_graph["visited"]:
+                continue
+            tags_list = self.package_graph["visited"][name]
+            if not tags_list:
+                continue
+            for tags in tags_list:
+                self.update_filter(name, tags, "req")
+                self.update_filter(name, tags, "ava")
+                self.update_filter(name, tags, "ban")
+                self.update_filter(name, tags, "alt")
+                self.update_filter(name, tags, "xor")
+
+    def clear_inherit(self, name, tags_list):
         inherit_pkgs = Environ(Config.Env.PACKAGE_ROOT).envlist()
         inherit_pkgs = [os.path.join(i, Config.PACKAGE_NAME) for i in inherit_pkgs]
         for path in inherit_pkgs:
@@ -649,17 +719,6 @@ class Acquire(Resolve):
                     else:
                         os.environ.pop(k)
 
-    def vis_inherit(self, vis_exists):
-        inherit_pkgs = Environ(Config.Env.PACKAGE_ROOT).envlist()
-        inherit_pkgs = [os.path.join(i, Config.PACKAGE_NAME) for i in inherit_pkgs]
-        inherit_pkgs.reverse()
-        for path in inherit_pkgs:
-            if self.safe_exists(path):
-                this = Thispath(path)
-                if this.name not in vis_exists:
-                    vis_exists[this.name] = [this.tags]
-        return vis_exists
-
     def load_syncer(self):
         try:
             from wishapi import Syncer
@@ -668,10 +727,33 @@ class Acquire(Resolve):
         except Exception:
             err = "".join(traceback.format_exception(*sys.exc_info()))
             if Config.VERBOSE == "+":
-                sys.stdout.write("Load Error:\n")
                 sys.stdout.write(err)
                 sys.stdout.flush()
             self.syncer = None
+
+    def load_solver(self):
+        try:
+            from wishapi import Solver
+
+            self.solver = Solver(self, Config, Environ)
+        except Exception:
+            err = "".join(traceback.format_exception(*sys.exc_info()))
+            if Config.VERBOSE == "+":
+                sys.stdout.write(err)
+                sys.stdout.flush()
+            self.solver = None
+
+    def load_dbmanage(self):
+        try:
+            from wishapi import DBManage
+
+            self.dbmanage = DBManage(Config, Environ)
+        except Exception:
+            err = "".join(traceback.format_exception(*sys.exc_info()))
+            if Config.VERBOSE == "+":
+                sys.stdout.write(err)
+                sys.stdout.flush()
+            self.dbmanage = None
 
 
 class Require(Acquire):
@@ -688,7 +770,14 @@ class Require(Acquire):
         for name, cons in pkgs.items():
             if name not in self.package_graph["graphed"]:
                 self.package_graph["graphed"][name] = dict()
+            if name not in self.package_graph["visited"]:
+                self.package_graph["visited"][name] = list()
             vers = self.combine_cons([self.resolve_cons(name, *co) for co in cons])
+            if name in self.package_state["init"]:
+                init_tags = self.package_graph["visited"][name]
+                if init_tags:
+                    vers = {tags: path for tags, path in vers.items() if tags in init_tags}
+                    self.package_graph["visited"][name] = list(vers.keys())
             for tags, paths in vers.items():
                 path = os.path.join(paths[-1], tags, Config.PACKAGE_NAME)
                 avas = self.parse_argv(path, "ava")
@@ -696,97 +785,148 @@ class Require(Acquire):
                     continue
                 if name not in self.package_graph["visited"]:
                     self.package_graph["visited"][name] = list()
-                if tags in self.package_graph["visited"][name]:
+                if tags in self.package_graph["graphed"][name]:
                     continue
                 reqs = self.parse_argv(path, "req")
                 exts = self.parse_argv(path, "ext")
                 bans = self.parse_argv(path, "ban")
+                alts = self.parse_argv(path, "alt")
+                xors = self.parse_argv(path, "xor")
+                exors = self.parse_argv(path, "xor", extend=False)
                 tags_dict = {
                     "ava": avas,
                     "req": reqs,
                     "ext": exts,
                     "ban": bans,
+                    "alt": alts,
+                    "xor": xors,
+                    "exor": exors,
                     "path": path,
                 }
                 self.package_graph["graphed"][name][tags] = tags_dict
                 self.package_graph["visited"][name].append(tags)
-                e_reqs = self.vis_extra(exts)
-                if e_reqs:
-                    reqs.extend(e_reqs)
-                self.resolve_pkgs(reqs)
+                self.vis_extra(exts, name, tags)
+                if reqs:
+                    self.resolve_pkgs(reqs)
+                if xors:
+                    self.resolve_pkgs(xors)
 
-    def vis_extra(self, exts):
-        reqs = list()
+    def vis_extra(self, exts, name, tags):
+
         enable_extra_pkgs = Environ(Config.Env.PACKAGE_EXTRA).envlist()
         for args in exts:
             if "@" in args:
-                args, enas = args.split("@")
+                if self.package_graph["pending"].get(name) is None:
+                    self.package_graph["pending"][name] = dict()
+                if self.package_graph["pending"][name].get(tags) is None:
+                    self.package_graph["pending"][name][tags] = list()
+                self.package_graph["pending"][name][tags].append(args)
             else:
-                enas = None
-            name = self.resolve_argv(args)[0]
-            if args in reqs:
-                continue
-            if name in enable_extra_pkgs:
-                reqs.append(args)
-            if self.resolve_autoadd(enas):
-                reqs.append(args)
-        return reqs
+                ext_name = self.resolve_argv(args)[0]
+                if ext_name in enable_extra_pkgs:
+                    if self.package_graph["pending"].get(ext_name) is None:
+                        self.package_graph["pending"][ext_name] = dict()
+                    if self.package_graph["pending"][ext_name].get(tags) is None:
+                        self.package_graph["pending"][ext_name][tags] = list()
+                    self.package_graph["pending"][ext_name][tags].append(args)
 
     def resolve_platform(self, args):
+        platform_info = Config.Platform()
         pkgs = self.combine_argv([{argv: self.resolve_argv(argv)} for argv in args])
         for name, cons in pkgs.items():
-            if name != Config.PLATFORM_KEY:
-                continue
-            if sys.platform not in [c[1] for c in cons]:
+            if name in platform_info:
+                if not self.resolve_architecture(name, cons, platform_info):
+                    return False
+        return True
+
+    def resolve_architecture(self, name, cons, platform_info):
+        for flag, tags, _ in cons:
+            if not self.resolve_tags(flag, tags, platform_info[name]):
                 return False
         return True
 
-    def resolve_autoadd(self, argv):
-        if argv is None:
-            return False
-        pkgs = self.combine_argv([{argv: self.resolve_argv(argv)}])
-        for name, cons in pkgs.items():
-            if name == Config.PLATFORM_KEY:
-                if sys.platform in [c[1] for c in cons]:
-                    return True
-            else:
-                current_visited = dict()
-                self.vis_inherit(current_visited)
-                if name not in current_visited:
-                    continue
-                for c in cons:
-                    tags_list = self.resolve_tags(c[0], c[1], current_visited[name])
-                    if tags_list:
-                        return True
-        return False
+    def resolve_pending(self, solution):
+        sub_solution = collections.OrderedDict()
+        filter_pending = list()
+        for name, tags in solution.items():
+            if name not in self.package_graph["pending"]:
+                continue
+            if tags not in self.package_graph["pending"][name]:
+                continue
+            filter_pending.extend(self.package_graph["pending"][name][tags])
 
-    def adaptive_tags(self, name, tags_list):
-        if name in self.package_state["adap"]:
-            return
-        self.package_state["adap"].append(name)
-        ctags_list = self.custom_sort(tags_list)
-        while ctags_list:
-            select_tags = True
-            tags = ctags_list.pop()
-            resolve_ava = self.resolve_filter(name, tags, "ava", self.filters["ava"])
-            if resolve_ava:
-                for aname, atags_list in resolve_ava.items():
-                    if atags_list:
-                        self.adaptive_tags(aname, atags_list)
-                    else:
-                        select_tags = False
-            resolve_req = self.resolve_filter(name, tags, "req", self.filters["req"])
-            if resolve_req:
-                for rname, rtags_list in resolve_req.items():
-                    if rtags_list:
-                        self.adaptive_tags(rname, rtags_list)
-                    else:
-                        select_tags = False
-            if select_tags:
-                self.package_graph["visited"][name] = ctags_list + [tags]
-                break
-            if not ctags_list:
-                self.package_graph["visited"][name] = ctags_list
+        args = list()
+        enas = collections.OrderedDict()
+        for argv in filter_pending:
+            if "@" in argv:
+                argv, enav = argv.split("@")
+                if enas.get(argv) is None:
+                    enas[argv] = list()
+                enas[argv].append(enav)
+            else:
+                args.append(argv)
+
+        platform_info = Config.Platform()
+        for ext_name, ext_env in enas.items():
+            env_pkgs = self.combine_argv([{argv: self.resolve_argv(argv)} for argv in ext_env])
+            for name, cons in env_pkgs.items():
+                if name in platform_info:
+                    if self.resolve_architecture(name, cons, platform_info):
+                        args.append(ext_name)
+                elif name in solution.keys():
+                    tags_list = [solution[name]]
+                    for c in cons:
+                        tags_list = self.resolve_tags(c[0], c[1], tags_list)
+                    if tags_list:
+                        args.append(ext_name)
+
+        if args:
+            self.resolve_pkgs(args)
+            pkgs = self.combine_argv([{argv: self.resolve_argv(argv)} for argv in args])
+            names = list(pkgs.keys())
+            for name in names:
+                if name not in self.package_graph["visited"]:
+                    Config.Msg.error("PENDING_ERROR", name, pkgs.get(name))
+                if not self.package_graph["visited"][name]:
+                    Config.Msg.error("PENDING_ERROR", name, pkgs.get(name))
+            self.build_filter(names)
+            sub_solution = self.solver.collect_solution(names)
+            if not sub_solution:
+                Config.Msg.error("RESOLVE_ERROR", names)
+        return sub_solution
+
+    def process_pkgs(self, args, syncer=True):
+        self.solution = None
+        self.load_solver()
+        self.load_dbmanage()
+        if syncer:
+            self.load_syncer()
+        self.resolve_pkgs(args)
+        self.build_filter()
+        for name in self.package_state["init"]:
+            if name not in self.package_graph["visited"]:
+                Config.Msg.error("RESOLVE_ERROR", name)
+            if not self.package_graph["visited"][name]:
+                Config.Msg.error("RESOLVE_ERROR", name)
+        names = self.package_state["init"]
+        self.solution = self.solver.collect_solution(names)
+        if not self.solution:
+            Config.Msg.error("RESOLVE_ERROR", names)
+        sub_solution = self.resolve_pending(self.solution)
+        self.solution = {**sub_solution, **self.solution}
+        return self.solution
+
+    def process_paths(self):
+        self.path_list = list()
+        for k, v in self.solution.items():
+            graphed = self.package_graph["graphed"]
+            if self.syncer:
+                self.syncer.update_timestamp(k, v)
+            if self.dbmanage:
+                self.dbmanage.update_timestamp(k, v)
+            self.path_list.append(graphed[k][v]["path"])
+        self.path_list.reverse()
+        return self.path_list
 
     def exec_path(self, path):
         init = False
@@ -796,7 +936,7 @@ class Require(Acquire):
         if not self.safe_exists(path):
             Config.Msg.error("NETWORK_ERROR", "req", this.name, this.tags)
         try:
-            extractor = Extractor("req", "ava", "ext", "ban")
+            extractor = Extractor("req", "ava", "ext", "ban", "alt", "xor")
             tree = ast.parse(self.safe_open(path))
             ast_obj = extractor.visit(tree)
             code_obj = compile(ast_obj, filename=path, mode="exec")
@@ -815,73 +955,14 @@ class Require(Acquire):
             err = "".join(traceback.format_exception(*sys.exc_info()))
             Config.Msg.error("CONFIG_ERROR", path, err)
 
-    def apply_filter(self, real_visited):
-        ban_data = dict()
-        for name, tags_list in real_visited.items():
-            if not tags_list:
-                Config.Msg.error("RESOLVE_ERROR", name, self.build_info(name))
-            tags = tags_list[-1]
-            resolve_ban = self.resolve_filter(name, tags, "ban", self.filters["ban"])
-            for bname, btags_list in resolve_ban.items():
-                if not btags_list:
-                    continue
-                if bname not in ban_data:
-                    ban_data[bname] = list()
-                for i in btags_list:
-                    ban_data[bname].append(i)
-        for bname, blist in ban_data.items():
-            self.ban_inherit(bname, blist)
-            if bname not in real_visited:
-                continue
-            tags_list = real_visited[bname]
-            for i in tags_list:
-                if i in blist:
-                    real_visited[bname].remove(i)
-            if not real_visited[bname]:
-                real_visited.pop(bname)
-        return real_visited
-
-    def process_pkgs(self, args, syncer=True):
-        if syncer:
-            self.load_syncer()
-        self.resolve_pkgs(args)
-        for name in self.package_graph["visited"].keys():
-            tags_list = self.package_graph["visited"][name]
-            if not tags_list:
-                continue
-            for tags in tags_list:
-                self.update_filter(name, tags, "req")
-                self.update_filter(name, tags, "ava")
-                self.update_filter(name, tags, "ban")
-        self.vis_inherit(self.package_graph["visited"])
-        for name, tags_list in self.package_graph["visited"].items():
-            self.adaptive_tags(name, tags_list)
-        real_visited = collections.OrderedDict()
-        for name in self.package_state["init"]:
-            if name not in self.package_graph["visited"]:
-                Config.Msg.error("RESOLVE_ERROR", name, self.build_info(name))
-            if not self.package_graph["visited"][name]:
-                Config.Msg.error("RESOLVE_ERROR", name, self.build_info(name))
-            tags = self.package_graph["visited"][name][-1]
-            self.recursion_tags(name, tags, real_visited)
-        self.package_graph["visited"] = self.apply_filter(real_visited)
-        return self.package_graph["visited"]
-
-    def process_paths(self):
-        self.path_list = list()
-        for k, v in self.package_graph["visited"].items():
-            graphed = self.package_graph["graphed"]
-            v = self.custom_sort(v)
-            if k in graphed:
-                if self.syncer:
-                    self.syncer.update_timestamp(k, v[-1])
-                self.path_list.append(graphed[k][v[-1]]["path"])
-        self.path_list.reverse()
-        return self.path_list
-
     def exec_reqs(self):
         for path in self.path_list:
             self.exec_path(path)
+        inherit_pkgs = Environ(Config.Env.PACKAGE_ROOT).envlist()
+        for path in inherit_pkgs:
+            this = Thispath(os.path.join(path, Config.PACKAGE_NAME))
+            if this.name not in self.package_graph["visited"]:
+                self.clear_inherit(this.name, [this.tags])
 
     def exec(self, *args):
         if not args:
@@ -893,22 +974,20 @@ class Require(Acquire):
 
 def main():
     command_list = list()
+    command_argv = list()
     mark_list = ("-", "+")
     start_time = time.time()
     argv_list = sys.argv[1:]
     command = os.environ.get("SHELL")
+    if not Environ(Config.Env.OFFLINE_MODE).getenv():
+        Environ(Config.Env.OFFLINE_MODE).setenv("0")
+    if not Environ(Config.Env.DEVELOP_MODE).getenv():
+        Environ(Config.Env.DEVELOP_MODE).setenv("0")
     if not Environ(Config.Env.PACKAGE_PATH).getenv():
-        Environ(Config.Env.PACKAGE_PATH).setenv(
-            os.path.join(os.path.expanduser("~"), ".packages")
-        )
-    if not Environ(Config.Env.PACKAGE_MODE).getenv():
-        Environ(Config.Env.PACKAGE_MODE).setenv("0")
-    storage_path = Environ(Config.Env.STORAGE_PATH).getenv()
-    if storage_path:
-        Environ(Config.Env.PACKAGE_PATH).insert(storage_path)
+        Environ(Config.Env.PACKAGE_PATH).setenv(os.path.join(os.path.expanduser("~"), ".packages"))
     develop_path = Environ(Config.Env.DEVELOP_PATH).getenv()
     if develop_path:
-        if Environ(Config.Env.PACKAGE_MODE).getenv() == "0":
+        if Environ(Config.Env.DEVELOP_MODE).getenv() == "0":
             Environ(Config.Env.PACKAGE_PATH).remove(develop_path)
         else:
             Environ(Config.Env.PACKAGE_PATH).insert(develop_path)
@@ -917,10 +996,13 @@ def main():
         Config.VERBOSE = mark_info.get(sorted(mark_info.keys())[0])
         num = argv_list.index(Config.VERBOSE) + 1
         command_list = argv_list[num:]
-        argv_list = argv_list[: argv_list.index(Config.VERBOSE)]
-    Require().exec(*argv_list)
+        command_argv = argv_list[: argv_list.index(Config.VERBOSE)]
     if Config.VERBOSE == "+":
-        sys.stdout.write("Total Time:  {:.2f}s\n".format(time.time() - start_time))
+        sys.stdout.write("Run: wish {}\n".format((" ").join(argv_list)))
+        sys.stdout.flush()
+    Require().exec(*command_argv)
+    if Config.VERBOSE == "+":
+        sys.stdout.write("Total Time: {:.2f}s\n".format(time.time() - start_time))
         sys.stdout.flush()
     Nickname.replace(command_list)
     command = (" ").join(command_list)

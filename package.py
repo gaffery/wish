@@ -4,8 +4,10 @@ import os
 
 req(
     "7zip",
-    "minio",
+    "python",
+    "python-sat",
     "requests",
+    "minio",
 )
 
 ava("python")
