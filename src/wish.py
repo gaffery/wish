@@ -998,7 +998,7 @@ def main():
         command_list = argv_list[num:]
         command_argv = argv_list[: argv_list.index(Config.VERBOSE)]
     if Config.VERBOSE == "+":
-        sys.stdout.write("Run: wish {}\n".format((" ").join(argv_list)))
+        sys.stdout.write("Execute: wish {}\n".format((" ").join(argv_list)))
         sys.stdout.flush()
     Require().exec(*command_argv)
     if Config.VERBOSE == "+":
