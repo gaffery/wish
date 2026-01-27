@@ -56,10 +56,9 @@ class Config(object):
         STORAGE_PATH = "WISH_STORAGE_PATH"
         DEVELOP_PATH = "WISH_DEVELOP_PATH"
 
-        LOCK_MODE = "WISH_LOCK_MODE"
         DEVELOP_MODE = "WISH_DEVELOP_MODE"
         OFFLINE_MODE = "WISH_OFFLINE_MODE"
-
+        INHERIT_MODE = "WISH_INHERIT_MODE"
         PACKAGE_EXTRA = "WISH_PACKAGE_EXTRA"
 
     class Msg(object):
@@ -492,12 +491,22 @@ class Resolve(object):
         parsed_tags_list = [self.version_key(t) for t in tags_list]
         if flag == "=":
             for i, t in enumerate(parsed_tags_list):
-                if t[0][0] == 0 and parsed_tags[0][0] == 0:
-                    if t[0][1].startswith(parsed_tags[0][1]) and t[1 : len(parsed_tags)] == parsed_tags[1:]:
-                        filter_list.append(tags_list[i])
-                else:
-                    if t[: len(parsed_tags)] == parsed_tags:
-                        filter_list.append(tags_list[i])
+                if len(t) < len(parsed_tags):
+                    continue
+                ok = True
+                for j in range(len(parsed_tags)):
+                    pt = parsed_tags[j]
+                    tt = t[j]
+                    if pt[0] == 0 and tt[0] == 0:
+                        if not tt[1].startswith(pt[1]):
+                            ok = False
+                            break
+                    else:
+                        if tt != pt:
+                            ok = False
+                            break
+                if ok:
+                    filter_list.append(tags_list[i])
         else:
             filter_list = [tags_list[i] for i, t in enumerate(parsed_tags_list) if self.operators[flag](t, parsed_tags)]
         return filter_list
@@ -695,29 +704,30 @@ class Acquire(Resolve):
                 self.update_filter(name, tags, "xor")
 
     def clear_inherit(self, name, tags_list):
-        inherit_pkgs = Environ(Config.Env.PACKAGE_ROOT).envlist()
-        inherit_pkgs = [os.path.join(i, Config.PACKAGE_NAME) for i in inherit_pkgs]
-        for path in inherit_pkgs:
-            this = Thispath(path)
-            if this.name != name:
-                continue
-            if this.tags not in tags_list:
-                continue
-            for k, v in os.environ.items():
-                if not v:
+        if Environ(Config.Env.INHERIT_MODE).getenv() == "0":
+            inherit_pkgs = Environ(Config.Env.PACKAGE_ROOT).envlist()
+            inherit_pkgs = [os.path.join(i, Config.PACKAGE_NAME) for i in inherit_pkgs]
+            for path in inherit_pkgs:
+                this = Thispath(path)
+                if this.name != name:
                     continue
-                rm_flag = False
-                v_list = list()
-                v_list = v.split(os.pathsep)
-                for sv in v_list:
-                    if sv.startswith(this.root):
-                        rm_flag = True
-                        v_list.remove(sv)
-                if rm_flag:
-                    if v_list:
-                        os.environ[k] = os.pathsep.join(v_list)
-                    else:
-                        os.environ.pop(k)
+                if this.tags not in tags_list:
+                    continue
+                for k, v in os.environ.items():
+                    if not v:
+                        continue
+                    rm_flag = False
+                    v_list = list()
+                    v_list = v.split(os.pathsep)
+                    for sv in v_list:
+                        if sv.startswith(this.root):
+                            rm_flag = True
+                            v_list.remove(sv)
+                    if rm_flag:
+                        if v_list:
+                            os.environ[k] = os.pathsep.join(v_list)
+                        else:
+                            os.environ.pop(k)
 
     def load_syncer(self):
         try:
@@ -879,7 +889,13 @@ class Require(Acquire):
                         tags_list = self.resolve_tags(c[0], c[1], tags_list)
                     if tags_list:
                         args.append(ext_name)
-
+                else:
+                    for sol_name, sol_ver in solution.items():
+                        alt_dict = self.resolve_filter(sol_name, sol_ver, "alt")
+                        if name in alt_dict:
+                            alt_cons = alt_dict[name]
+                            if self.rules_compatible(cons, alt_cons):
+                                args.append(ext_name)
         if args:
             self.resolve_pkgs(args)
             pkgs = self.combine_argv([{argv: self.resolve_argv(argv)} for argv in args])
@@ -983,6 +999,8 @@ def main():
         Environ(Config.Env.OFFLINE_MODE).setenv("0")
     if not Environ(Config.Env.DEVELOP_MODE).getenv():
         Environ(Config.Env.DEVELOP_MODE).setenv("0")
+    if not Environ(Config.Env.INHERIT_MODE).getenv():
+        Environ(Config.Env.INHERIT_MODE).setenv("0")
     if not Environ(Config.Env.PACKAGE_PATH).getenv():
         Environ(Config.Env.PACKAGE_PATH).setenv(os.path.join(os.path.expanduser("~"), ".packages"))
     develop_path = Environ(Config.Env.DEVELOP_PATH).getenv()
