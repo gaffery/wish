@@ -280,16 +280,18 @@ class Resolve(object):
             "alt": dict(),
             "xor": dict(),
         }
+
+        self.package_graph = {
+            "initial": collections.OrderedDict(),
+            "graphed": collections.OrderedDict(),
+            "visited": collections.OrderedDict(),
+            "pending": collections.OrderedDict(),
+        }
+
         self.package_state = {
             "init": list(),
             "args": list(),
             "adap": list(),
-        }
-
-        self.package_graph = {
-            "graphed": collections.OrderedDict(),
-            "visited": collections.OrderedDict(),
-            "pending": collections.OrderedDict(),
         }
 
     def safe_open(self, path):
@@ -661,10 +663,10 @@ class Acquire(Resolve):
                     if not self.resolve_architecture(kname, kcons, platform_info):
                         return {kname: list()}
                     continue
+                if key in ("alt",):
+                    resolve_dict[kname] = kcons
+                    continue
                 if kname not in self.package_graph["visited"]:
-                    if key in ("alt",):
-                        resolve_dict[kname] = kcons
-                        continue
                     resolve_dict[kname] = list()
                     continue
                 ktags_list = self.package_graph["visited"][kname]
@@ -776,6 +778,7 @@ class Require(Acquire):
         self.package_state["args"].append(args)
         pkgs = self.combine_argv([{argv: self.resolve_argv(argv)} for argv in args])
         if not self.package_state["init"]:
+            self.package_graph["initial"] = pkgs
             self.package_state["init"] = list(pkgs.keys())
         for name, cons in pkgs.items():
             if name not in self.package_graph["graphed"]:
@@ -783,11 +786,13 @@ class Require(Acquire):
             if name not in self.package_graph["visited"]:
                 self.package_graph["visited"][name] = list()
             vers = self.combine_cons([self.resolve_cons(name, *co) for co in cons])
-            if name in self.package_state["init"]:
-                init_tags = self.package_graph["visited"][name]
-                if init_tags:
-                    vers = {tags: path for tags, path in vers.items() if tags in init_tags}
-                    self.package_graph["visited"][name] = list(vers.keys())
+            if name in self.package_graph["initial"]:
+                init_cons = self.package_graph["initial"][name]
+                valid_tags = list(vers.keys())
+                for con_flag, con_tags, _ in init_cons:
+                    valid_tags = self.resolve_tags(con_flag, con_tags, valid_tags)
+                vers = {t: p for t, p in vers.items() if t in valid_tags}
+
             for tags, paths in vers.items():
                 path = os.path.join(paths[-1], tags, Config.PACKAGE_NAME)
                 avas = self.parse_argv(path, "ava")
@@ -959,6 +964,8 @@ class Require(Acquire):
             if Config.VERBOSE == "+":
                 sys.stdout.write("Setup Path: {}\n".format(path))
                 sys.stdout.flush()
+            if Environ(Config.Env.DEVELOP_MODE).getenv() == "2":
+                init = True
             this = Thispath(path, env=True, init=init)
             modules = {
                 "this": this,
