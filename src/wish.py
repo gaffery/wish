@@ -715,21 +715,22 @@ class Acquire(Resolve):
                     continue
                 if this.tags not in tags_list:
                     continue
-                for k, v in os.environ.items():
+                root_norm = os.path.normcase(os.path.normpath(this.root))
+                for k, v in list(os.environ.items()):
                     if not v:
                         continue
-                    rm_flag = False
-                    v_list = list()
                     v_list = v.split(os.pathsep)
+                    new_v_list = []
                     for sv in v_list:
-                        if sv.startswith(this.root):
-                            rm_flag = True
-                            v_list.remove(sv)
-                    if rm_flag:
-                        if v_list:
-                            os.environ[k] = os.pathsep.join(v_list)
+                        sv_norm = os.path.normcase(os.path.normpath(sv))
+                        if sv_norm == root_norm or sv_norm.startswith(root_norm + os.sep):
+                            continue
+                        new_v_list.append(sv)
+                    if len(new_v_list) != len(v_list):
+                        if new_v_list:
+                            os.environ[k] = os.pathsep.join(new_v_list)
                         else:
-                            os.environ.pop(k)
+                            os.environ.pop(k, None)
 
     def load_syncer(self):
         try:
@@ -1032,6 +1033,8 @@ def main():
     Nickname.replace(command_list)
     command = (" ").join(command_list)
     exit_code = os.system(command)
+    if os.name == "nt":
+        sys.exit(exit_code)
     sys.exit(exit_code >> 8)
 
 

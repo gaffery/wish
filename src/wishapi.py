@@ -142,35 +142,59 @@ class Solver(object):
         result = dict()
         for pkg, vers in visited.items():
             sorted_vers = self.parent.custom_sort(vers)
-            level = level_info.get(pkg, 0) if level_info else 0
+            level_data = level_info.get(pkg, 0) if level_info else 0
+            if isinstance(level_data, tuple):
+                level, position = level_data
+            else:
+                level, position = level_data, 0
             keep_count = max(min_versions_limit, max_versions_limit // (2**level))
+            if level == 0 and position > 0:
+                entry_penalty = min(position, max(0, keep_count - min_versions_limit))
+                keep_count -= entry_penalty
             result[pkg] = sorted_vers[-keep_count:]
         return result
 
-    def collect_progressively_solve(self, entry_names, solver_function):
-        max_versions = 50
+    def collect_progressively_solve(self, entry_names, solver_function, fallback_solver_function=None):
         min_versions_limit = 5
         max_versions_limit = 10
 
+        if fallback_solver_function is None:
+            fallback_solver_function = solver_function
+
         original_visited = self.parent.package_graph["visited"]
         levels = self.build_levels(entry_names, original_visited)
-        level_only = {pkg: lvl for pkg, (lvl, _) in levels.items()}
+        solution_weights = self.build_solution_weights(entry_names, levels, original_visited)
+        best_solution = None
+        best_objective = None
+        optimal_signature = self.build_solution_signature(None, entry_names, original_visited)
 
-        for n in range(1, max_versions + 1):
+        for n in range(min_versions_limit, max_versions_limit + 1):
             visited_subset = self.collect_limit_versions(
                 original_visited,
+                n,
                 min_versions_limit,
-                min(n, max_versions_limit),
-                level_info=level_only,
+                level_info=levels,
             )
             solution = solver_function(entry_names, visited=visited_subset)
             if solution:
-                return solution
-        solution = solver_function(entry_names, visited=original_visited)
+                objective = self.build_solution_objective(
+                    solution,
+                    entry_names,
+                    levels,
+                    original_visited,
+                    solution_weights=solution_weights,
+                )
+                if best_objective is None or objective > best_objective:
+                    best_solution = solution
+                    best_objective = objective
+                if objective[0] == optimal_signature:
+                    return solution
+        solution = fallback_solver_function(entry_names, visited=original_visited)
         if solution:
             return solution
-        else:
-            self.collect_verbose_info(original_visited)
+        if best_solution:
+            return best_solution
+        self.collect_verbose_info(original_visited)
 
     def collect_solution(self, entry_names):
         if self.enable_sat:
@@ -183,28 +207,108 @@ class Solver(object):
         from pysat.formula import WCNF
         from pysat.examples.rc2 import RC2
 
-        wcnf = WCNF()
         var_map, rev_var_map, rel_var_map = self.build_map_data(visited)
         constraints = self.build_constraints(entry_names, var_map, rel_var_map, visited)
+        levels = self.build_levels(entry_names, visited)
+        locked_entries = self.build_entry_solution_sat(entry_names, visited, var_map, constraints)
+        if locked_entries is None:
+            return None
+        entry_assumptions = [var_map[(pkg, ver)] for pkg, ver in locked_entries.items() if (pkg, ver) in var_map]
+        feasible_tail_versions = self.build_feasible_solution_versions_sat(
+            visited,
+            var_map,
+            constraints,
+            assumptions=entry_assumptions,
+            package_names=[pkg for pkg in visited if pkg not in entry_names and len(visited.get(pkg, [])) > 1],
+        )
+        solution_weights = self.build_tail_solution_weights(
+            entry_names,
+            levels,
+            visited,
+            feasible_versions=feasible_tail_versions,
+        )
+
+        if not solution_weights:
+            model = self.build_sat_model(constraints, assumptions=entry_assumptions)
+            return self.build_solution_from_model(model, rev_var_map, entry_names, rel_var_map, levels)
+
+        wcnf = WCNF()
         for clause in constraints:
             wcnf.append(clause)
-        levels = self.build_levels(entry_names, visited)
-        weights = self.build_weights(var_map, levels, visited)
+        for assumption in entry_assumptions:
+            wcnf.append([assumption])
+        soft_weights = self.build_solution_softweights(var_map, solution_weights)
         for (pkg, ver), var in var_map.items():
-            if var in weights:
-                wcnf.append([var], weights[var])
+            if var in soft_weights:
+                wcnf.append([var], soft_weights[var])
         with RC2(wcnf) as rc2_solver:
             model = rc2_solver.compute()
-            if model is None:
-                return None
-            solution = collections.OrderedDict()
-            for idx in model:
-                if idx > 0 and idx in rev_var_map:
-                    pkg, ver = rev_var_map[idx]
-                    solution[pkg] = ver
-            solution = self.build_prune_solution(solution, entry_names, rel_var_map)
-            solution = self.build_sort_solution(solution, levels)
-            return solution
+            return self.build_solution_from_model(model, rev_var_map, entry_names, rel_var_map, levels)
+
+    def build_sat_model(self, constraints, assumptions=None):
+        from pysat.solvers import Solver as SATSolver
+
+        with SATSolver(bootstrap_with=constraints) as sat_solver:
+            if sat_solver.solve(assumptions=assumptions or []):
+                return sat_solver.get_model()
+
+    def build_solution_from_model(self, model, rev_var_map, entry_names, rel_var_map, levels):
+        if model is None:
+            return None
+        solution = collections.OrderedDict()
+        for idx in model:
+            if idx > 0 and idx in rev_var_map:
+                pkg, ver = rev_var_map[idx]
+                solution[pkg] = ver
+        solution = self.build_prune_solution(solution, entry_names, rel_var_map)
+        solution = self.build_sort_solution(solution, levels)
+        return solution
+
+    def build_feasible_solution_versions_sat(self, visited, var_map, constraints, assumptions=None, package_names=None):
+        from pysat.solvers import Solver as SATSolver
+
+        if package_names is None:
+            package_names = visited.keys()
+        package_names = set(package_names)
+        feasible_versions = {}
+        with SATSolver(bootstrap_with=constraints) as sat_solver:
+            base_assumptions = assumptions or []
+            for pkg, versions in visited.items():
+                if pkg not in package_names:
+                    continue
+                allowed_versions = []
+                for version in self.parent.custom_sort(versions):
+                    sat_var = var_map.get((pkg, version))
+                    if sat_var is None:
+                        continue
+                    if sat_solver.solve(assumptions=base_assumptions + [sat_var]):
+                        allowed_versions.append(version)
+                feasible_versions[pkg] = allowed_versions
+        return feasible_versions
+
+    def build_entry_solution_sat(self, entry_names, visited, var_map, constraints):
+        from pysat.solvers import Solver as SATSolver
+
+        locked_solution = collections.OrderedDict()
+        assumptions = []
+        with SATSolver(bootstrap_with=constraints) as sat_solver:
+            for name in entry_names:
+                versions = self.parent.custom_sort(visited.get(name, []))
+                if not versions:
+                    return None
+                chosen_version = None
+                for version in reversed(versions):
+                    sat_var = var_map.get((name, version))
+                    if sat_var is None:
+                        continue
+                    if sat_solver.solve(assumptions=assumptions + [sat_var]):
+                        assumptions.append(sat_var)
+                        locked_solution[name] = version
+                        chosen_version = version
+                        break
+                if chosen_version is None:
+                    return None
+        return locked_solution
 
     def build_map_data(self, visited):
         idx = 1
@@ -223,16 +327,98 @@ class Solver(object):
                 idx += 1
         return var_map, rev_var_map, rel_var_map
 
-    def build_weights(self, var_map, levels, visited):
+    def build_solution_weight(self, pkg, ver, levels, visited):
+        sorted_vers = self.parent.custom_sort(visited.get(pkg, []))
+        rank = sorted_vers.index(ver)
+        lvl, pos = levels.get(pkg)
+        return (100 - pos) * 10000 + (100 - lvl) * 100 + rank
+
+    def build_solution_steps(self, entry_names, levels, visited):
+        base_bound = 0
+        for pkg, vers in visited.items():
+            if pkg not in levels:
+                continue
+            if not vers:
+                continue
+            pkg_bound = max(self.build_solution_weight(pkg, ver, levels, visited) for ver in vers)
+            base_bound += pkg_bound
+
+        steps = {}
+        tail_bound = base_bound
+        for name in reversed(entry_names):
+            versions = visited.get(name, [])
+            max_rank = max(len(versions) - 1, 0)
+            step = tail_bound + 1
+            steps[name] = step
+            tail_bound += step * max_rank
+        return steps
+
+    def build_solution_weights(self, entry_names, levels, visited):
+        steps = self.build_solution_steps(entry_names, levels, visited)
         weights = {}
-        for (pkg, ver), var in var_map.items():
-            sorted_vers = self.parent.custom_sort(visited.get(pkg, []))
-            rank = sorted_vers.index(ver)
-            if pkg in levels:
-                lvl, pos = levels.get(pkg)
-                weight = (100 - pos) * 10000 + (100 - lvl) * 100 + rank
-                weights[var] = weight
+        for pkg, vers in visited.items():
+            if pkg not in levels:
+                continue
+            sorted_vers = self.parent.custom_sort(vers)
+            for rank, ver in enumerate(sorted_vers):
+                weight = self.build_solution_weight(pkg, ver, levels, visited)
+                if pkg in steps:
+                    weight += rank * steps[pkg]
+                weights[(pkg, ver)] = weight
         return weights
+
+    def build_tail_solution_weights(self, entry_names, levels, visited, feasible_versions=None):
+        entry_set = set(entry_names)
+        all_weights = self.build_solution_weights(entry_names, levels, visited)
+        feasible_versions = feasible_versions or {}
+        tail_weights = {}
+        for (pkg, ver), weight in all_weights.items():
+            if pkg in entry_set:
+                continue
+            allowed_versions = feasible_versions.get(pkg, visited.get(pkg, []))
+            if len(allowed_versions) <= 1:
+                continue
+            if ver not in allowed_versions:
+                continue
+            tail_weights[(pkg, ver)] = weight
+        return tail_weights
+
+    def build_solution_score(self, solution, entry_names, levels, visited, solution_weights=None):
+        if solution_weights is None:
+            solution_weights = self.build_solution_weights(entry_names, levels, visited)
+        return sum(solution_weights.get((pkg, ver), 0) for pkg, ver in solution.items())
+
+    def build_solution_objective(self, solution, entry_names, levels, visited, solution_weights=None):
+        signature = self.build_solution_signature(solution, entry_names, visited)
+        score = self.build_solution_score(
+            solution,
+            entry_names,
+            levels,
+            visited,
+            solution_weights=solution_weights,
+        )
+        return signature, score
+
+    def build_solution_signature(self, solution, entry_names, visited):
+        signature = []
+        for name in entry_names:
+            versions = self.parent.custom_sort(visited.get(name, []))
+            if solution is None:
+                signature.append(max(len(versions) - 1, -1))
+                continue
+            chosen_version = solution.get(name)
+            if chosen_version not in versions:
+                signature.append(-1)
+                continue
+            signature.append(versions.index(chosen_version))
+        return tuple(signature)
+
+    def build_solution_softweights(self, var_map, solution_weights):
+        soft_weights = {}
+        for (pkg, ver), var in var_map.items():
+            if (pkg, ver) in solution_weights:
+                soft_weights[var] = solution_weights[(pkg, ver)]
+        return soft_weights
 
     def build_levels(self, entry_names, visited):
         levels = {}
@@ -417,9 +603,10 @@ class Solver(object):
         valid_solutions = self.build_valid_solutions(all_solutions)
         self.parent.package_graph["visited"] = original_visited
         if valid_solutions:
+            levels = self.build_levels(entry_names, visited)
             solutions_sorted = sorted(
                 valid_solutions,
-                key=self.build_solution_priority(valid_solutions),
+                key=self.build_solution_priority(entry_names, levels, visited),
                 reverse=True,
             )
             best_solution = solutions_sorted[0]
@@ -456,36 +643,78 @@ class Solver(object):
             new_picked[current_name] = version
             yield from self.build_all_solutions(remaining_names, new_picked)
 
-    def build_solution_priority(self, valid_solutions):
-        first_keys = list(valid_solutions[0].keys())
-        field_scores = collections.OrderedDict()
-        for key in first_keys:
-            values = list({sol.get(key) for sol in valid_solutions if key in sol})
-            sorted_values = self.parent.custom_sort(values)
-            field_scores[key] = {v: i for i, v in enumerate(sorted_values)}
+    def build_solution_priority(self, entry_names, levels, visited):
+        solution_weights = self.build_solution_weights(entry_names, levels, visited)
 
         def solution_key(sol):
-            score = []
-            for key in field_scores.keys():
-                val = sol.get(key)
-                score.append(field_scores[key].get(val, -1))
-            return score
+            return self.build_solution_objective(
+                sol,
+                entry_names,
+                levels,
+                visited,
+                solution_weights=solution_weights,
+            )
 
         return solution_key
 
     def build_valid_solutions(self, solutions):
         def is_valid_solution(self, sol):
+            selected_visited = collections.defaultdict(list)
+            for pkg, ver in sol.items():
+                selected_visited[pkg].append(ver)
+
             for name, tags in sol.items():
+                current_meta = self.parent.package_graph["graphed"].get(name, {}).get(tags, {})
+                resolve_reqs = self.parent.resolve_filter(name, tags, "req")
+                if resolve_reqs:
+                    raw_reqs = current_meta.get("req", [])
+                    all_req_cons = self.parent.combine_argv([{s: self.parent.resolve_argv(s)} for s in raw_reqs])
+                    for dep_name, dep_tags_list in resolve_reqs.items():
+                        if dep_name in sol and sol[dep_name] in dep_tags_list:
+                            continue
+                        dep_cons = all_req_cons.get(dep_name)
+                        if dep_cons and self.check_alt_providers(dep_name, dep_cons, selected_visited):
+                            continue
+                        return False
+
                 resolve_ava = self.parent.resolve_filter(name, tags, "ava")
                 if not resolve_ava:
-                    continue
-                found_one_valid_ava = False
-                for dep_name, dep_tags_list in resolve_ava.items():
+                    resolve_ava = {}
+                if resolve_ava:
+                    raw_ava = current_meta.get("ava", [])
+                    all_ava_cons = self.parent.combine_argv([{s: self.parent.resolve_argv(s)} for s in raw_ava])
+                    found_one_valid_ava = False
+                    for dep_name, dep_tags_list in resolve_ava.items():
+                        if dep_name in sol and sol[dep_name] in dep_tags_list:
+                            found_one_valid_ava = True
+                            break
+                        dep_cons = all_ava_cons.get(dep_name)
+                        if dep_cons and self.check_alt_providers(dep_name, dep_cons, selected_visited):
+                            found_one_valid_ava = True
+                            break
+                    if not found_one_valid_ava:
+                        return False
+
+                resolve_ban = self.parent.resolve_filter(name, tags, "ban")
+                for dep_name, dep_tags_list in resolve_ban.items():
                     if dep_name in sol and sol[dep_name] in dep_tags_list:
-                        found_one_valid_ava = True
-                        break
-                if not found_one_valid_ava:
-                    return False
+                        return False
+
+                resolve_xor = self.parent.resolve_filter(name, tags, "xor")
+                raw_xor = current_meta.get("exor", [])
+                for xor_group in raw_xor:
+                    matched_count = 0
+                    for xor_pkg_string in xor_group:
+                        xor_pkg_name, flag, xor_tags, path = self.parent.resolve_argv(xor_pkg_string)
+                        allowed_tags = resolve_xor.get(xor_pkg_name, [])
+                        if xor_pkg_name in sol and sol[xor_pkg_name] in allowed_tags:
+                            matched_count += 1
+                            continue
+                        dep_cons = [(flag, xor_tags, path)]
+                        if self.check_alt_providers(xor_pkg_name, dep_cons, selected_visited):
+                            matched_count += 1
+                    if raw_xor and matched_count != 1:
+                        return False
             return True
 
         valid_solutions = list()
@@ -936,19 +1165,21 @@ class S3Client(Client):
 
 
 class DBPool(object):
-    _instance = None
+    _instances = {}
     _lock = threading.Lock()
 
     def __new__(cls, db_path, max_connections=10):
+        normalized_path = os.path.normcase(os.path.normpath(db_path))
         with cls._lock:
-            if cls._instance is None:
-                cls._instance = super(DBPool, cls).__new__(cls)
-                cls._instance.db_path = db_path
-                cls._instance.max_connections = max_connections
-                cls._instance._connections = []
-                cls._instance._in_use = set()
-                cls._instance._pool_lock = threading.Lock()
-            return cls._instance
+            if normalized_path not in cls._instances:
+                instance = super(DBPool, cls).__new__(cls)
+                instance.db_path = db_path
+                instance.max_connections = max_connections
+                instance._connections = []
+                instance._in_use = set()
+                instance._pool_lock = threading.Lock()
+                cls._instances[normalized_path] = instance
+            return cls._instances[normalized_path]
 
     def _create_connection(self):
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -1196,10 +1427,13 @@ class Syncer(object):
         return result
 
     def first_api_client(self, method_name, *args, **kwargs):
-        method = getattr(self.api_client, method_name)
-        result = method(*args, **kwargs)
-        if result:
-            return result
+        try:
+            method = getattr(self.api_client, method_name)
+            result = method(*args, **kwargs)
+            if result:
+                return result
+        except Exception:
+            pass
         main_env_value = self.config.Env.RESTAPI_URL
         for i in range(1, self.max_client + 1):
             api_env_value = self.environ(main_env_value + str(i)).getenv()
@@ -1279,7 +1513,9 @@ class Syncer(object):
     def clean_pkgs(self, path):
         this = self.thispath(path)
         base_path = os.path.dirname(this.root)
-        if not base_path.startswith(self.storage_path):
+        base_norm = os.path.normcase(os.path.normpath(base_path))
+        storage_norm = os.path.normcase(os.path.normpath(self.storage_path))
+        if base_norm != storage_norm and not base_norm.startswith(storage_norm + os.sep):
             return False
         name, tags, root = this.name, this.tags, this.root
         src_pkg = self.get_args(name, tags, "src")
