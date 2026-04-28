@@ -220,20 +220,10 @@ class Thispath(object):
         self.init = init
         plist = path.split(os.sep)
         self.root = os.path.dirname(path)
-        if self.part(path):
-            self.name = plist[-3]
-            self.tags = plist[-2]
-        else:
-            self.name = plist[-2]
-            self.tags = None
+        self.name = plist[-3]
+        self.tags = plist[-2]
         if env:
             Environ(Config.Env.PACKAGE_ROOT).append(self.root)
-
-    def part(self, path):
-        third_partys = Environ(Config.Env.PACKAGE_PATH).envlist()
-        for party in third_partys:
-            if path.startswith(party):
-                return True
 
     def envs(self, name):
         tags_dict = dict()
