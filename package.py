@@ -1,7 +1,6 @@
 # type: ignore
 import os
 
-
 req(
     "7zip",
     "python",
@@ -10,7 +9,7 @@ req(
     "minio",
 )
 
-ava("python")
+ava("python>=3.7")
 
 src_path = os.path.join(this.root, "src")
 env("PYTHONPATH").insert(src_path)

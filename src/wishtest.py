@@ -1045,7 +1045,8 @@ class WishCoreLogicTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as context:
                 wish_module.main()
 
-        self.assertEqual(2, context.exception.code)
+        expected = 512 if os.name == "nt" else 2
+        self.assertEqual(expected, context.exception.code)
         exec_mock.assert_called_once_with("demo")
 
     def test_main_without_package_args_raises_no_param(self):
@@ -1592,6 +1593,35 @@ class WishIntegrationTests(unittest.TestCase):
 
         self.assertEqual("1", solution["base"])
         self.assertEqual("1", solution["addon"])
+
+    def test_integration_resolve_pending_loads_nested_extension(self):
+        platform_name = sorted(Config.Platform()["platform"])[0]
+        self.configure_env()
+        self.write_package("base", "1", 'ext("middle@platform=%s")\n' % platform_name)
+        self.write_package("middle", "1", 'ext("leaf@platform=%s")\n' % platform_name)
+        self.write_package("leaf", "1", 'env("WISH_NESTED_EXT_MARK").setenv("enabled")\n')
+
+        require = self.make_require(enable_sat=False)
+        solution = require.process_pkgs(["base"], syncer=False)
+
+        self.assertEqual("1", solution["base"])
+        self.assertEqual("1", solution["middle"])
+        self.assertEqual("1", solution["leaf"])
+
+    def test_integration_pending_candidate_satisfies_entry_availability(self):
+        self.require_pysat()
+        platform_name = sorted(Config.Platform()["platform"])[0]
+        self.configure_env()
+        self.write_package("base", "1", 'ext("middle@platform=%s")\n' % platform_name)
+        self.write_package("middle", "1", "")
+        self.write_package("leaf", "1", 'ava("middle")\n')
+
+        require = self.make_require(enable_sat=True)
+        solution = require.process_pkgs(["leaf", "base"], syncer=False)
+
+        self.assertEqual("1", solution["base"])
+        self.assertEqual("1", solution["middle"])
+        self.assertEqual("1", solution["leaf"])
 
     def test_integration_cli_exec_sets_runtime_environment(self):
         self.configure_env()

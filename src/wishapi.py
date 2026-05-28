@@ -15,10 +15,306 @@ import urllib.parse
 from functools import lru_cache
 
 
+class DiagnosticCollector(object):
+    """Collects structured diagnostic information during package resolution."""
+
+    def __init__(self):
+        self.entry_failures = []
+        self.missing_deps = []
+        self.unavailable = []
+        self.conflicts = []
+        self.xor_violations = []
+        self.unsat_core = []
+        self.candidate_versions = {}
+        self.rejection_reasons = []
+        self.downgrades = []  # [(pkg, skipped_versions, chosen_version, reasons)]
+
+    def _append_unique(self, collection, item):
+        if item not in collection:
+            collection.append(item)
+
+    def add_entry_failure(self, pkg, versions_tried, reason):
+        # Keep only the latest (most complete) failure per package
+        self.entry_failures = [(p, v, r) for p, v, r in self.entry_failures if p != pkg]
+        self.entry_failures.append((pkg, list(versions_tried), reason))
+
+    def add_downgrade(self, pkg, skipped_versions, chosen_version, reasons):
+        # Keep only the latest downgrade per package (progressive solve calls multiple times)
+        self.downgrades = [(p, s, c, r) for p, s, c, r in self.downgrades if p != pkg]
+        self.downgrades.append((pkg, list(skipped_versions), chosen_version, list(reasons)))
+
+    def add_missing_dep(self, requester_pkg, requester_ver, dep_name, dep_cons=None):
+        self._append_unique(self.missing_deps, (requester_pkg, requester_ver, dep_name, dep_cons))
+
+    def add_unavailable(self, pkg, ver, required_by, required_cons=None):
+        self._append_unique(self.unavailable, (pkg, ver, required_by, required_cons))
+
+    def add_conflict(self, pkg_a, ver_a, pkg_b, ver_b, reason="ban"):
+        self._append_unique(self.conflicts, (pkg_a, ver_a, pkg_b, ver_b, reason))
+
+    def add_xor_violation(self, pkg, ver, xor_group, matched_count):
+        self._append_unique(self.xor_violations, (pkg, ver, list(xor_group), matched_count))
+
+    def add_unsat_core_entry(self, pkg, ver):
+        self._append_unique(self.unsat_core, (pkg, ver))
+
+    def set_candidate_versions(self, visited):
+        self.candidate_versions = {pkg: list(vers) for pkg, vers in visited.items()}
+
+    def add_rejection(self, solution, reason):
+        # Deduplicate by reason string (same root cause)
+        for _, existing_reason in self.rejection_reasons:
+            if existing_reason == reason:
+                return
+        self.rejection_reasons.append((collections.OrderedDict(solution), reason))
+
+    def has_diagnostics(self):
+        return bool(
+            self.entry_failures
+            or self.missing_deps
+            or self.unavailable
+            or self.conflicts
+            or self.xor_violations
+            or self.unsat_core
+            or self.rejection_reasons
+        )
+
+    def _format_constraint(self, constraint):
+        if not constraint:
+            return ""
+        if isinstance(constraint, (list, tuple)):
+            parts = []
+            for item in constraint:
+                if isinstance(item, (list, tuple)) and len(item) >= 3:
+                    flag, tags, path = item[:3]
+                    if path:
+                        parts.append("@{}".format(path))
+                    elif flag and tags is not None:
+                        parts.append("{}{}".format(flag, tags))
+                    elif tags is not None:
+                        parts.append(str(tags))
+                    else:
+                        parts.append("any version")
+                else:
+                    parts.append(str(item))
+            return ", ".join(parts)
+        return str(constraint)
+
+    def _format_versions(self, versions):
+        return ", ".join(str(ver) for ver in versions)
+
+    def format_report(self, verbose=False):
+        """Format diagnostics into human-readable report for stderr.
+
+        verbose=False (- mode): concise summary of root cause only.
+        verbose=True  (+ mode): full conflict analysis with all details.
+        """
+        lines = [""]
+
+        if self.entry_failures:
+            if verbose:
+                lines.append("[Entry Package Failures]")
+            for pkg, versions, reason in self.entry_failures:
+                if verbose:
+                    lines.append("  Package '{}' cannot be satisfied:".format(pkg))
+                    if versions:
+                        if len(versions) > 5:
+                            shown = self._format_versions(versions[:5])
+                            lines.append("    Candidate versions: {} ... ({} total)".format(shown, len(versions)))
+                        else:
+                            lines.append("    Candidate versions: {}".format(self._format_versions(versions)))
+                    else:
+                        lines.append("    No candidate versions found in any package path")
+                    available_versions = self.candidate_versions.get(pkg, []) if self.candidate_versions else []
+                    if available_versions:
+                        if len(available_versions) > 5:
+                            shown = self._format_versions(available_versions[:5])
+                            lines.append(
+                                "    Available versions: {} ... ({} total)".format(shown, len(available_versions))
+                            )
+                        else:
+                            lines.append("    Available versions: {}".format(self._format_versions(available_versions)))
+                    reason_parts = reason.split("; ")
+                    unique_reasons = {}
+                    version_set = set(str(v) for v in versions)
+                    for part in reason_parts:
+                        parts = part.split(" ", 1)
+                        if len(parts) == 2 and parts[0] in version_set:
+                            r = parts[1]
+                            if r not in unique_reasons:
+                                unique_reasons[r] = []
+                            unique_reasons[r].append(parts[0])
+                        else:
+                            unique_reasons[part] = []
+                    for r, vers in unique_reasons.items():
+                        if vers and len(vers) > 3:
+                            lines.append("    {} (all {} versions)".format(r, len(vers)))
+                        elif vers:
+                            lines.append("    {} ({})".format(r, ", ".join(vers)))
+                        else:
+                            lines.append("    {}".format(r))
+                else:
+                    if versions:
+                        lines.append(
+                            "  -> '{}' no satisfiable version (tried: {})".format(
+                                pkg, ", ".join(str(v) for v in versions[:3])
+                            )
+                        )
+                    else:
+                        lines.append("  -> '{}' not found in any package path".format(pkg))
+
+        if self.unsat_core:
+            if verbose:
+                lines.append("")
+                lines.append("[Conflict Core]")
+                lines.append("  The following package selections cannot coexist:")
+                for pkg, ver in self.unsat_core:
+                    lines.append("  - {} = {}".format(pkg, ver))
+            else:
+                core_str = ", ".join("{}={}".format(p, v) for p, v in self.unsat_core[:5])
+                lines.append("  -> Conflict core: {}".format(core_str))
+
+        if self.missing_deps:
+            if verbose:
+                lines.append("")
+                lines.append("[req() - Missing Dependencies]")
+                for req_pkg, req_ver, dep_name, dep_cons in self.missing_deps:
+                    cons_str = self._format_constraint(dep_cons)
+                    cons_str = " {}".format(cons_str) if cons_str else ""
+                    lines.append("  {}/{} declares req('{}{}')".format(req_pkg, req_ver, dep_name, cons_str))
+                    lines.append("    -> No matching version found; no alt() provider available")
+            else:
+                for req_pkg, req_ver, dep_name, dep_cons in self.missing_deps[:3]:
+                    cons_str = self._format_constraint(dep_cons)
+                    cons_str = "({})".format(cons_str) if cons_str else ""
+                    lines.append(
+                        "  -> [req] {}/{} req('{}'{}) - not found".format(
+                            req_pkg, req_ver, dep_name, " {}".format(cons_str) if cons_str else ""
+                        )
+                    )
+                if len(self.missing_deps) > 3:
+                    lines.append("  -> ... and {} more unresolved req()".format(len(self.missing_deps) - 3))
+
+        if self.unavailable:
+            if verbose:
+                lines.append("")
+                lines.append("[ava() - Availability Not Satisfied]")
+                by_required = collections.OrderedDict()
+                for pkg, ver, required_by, required_cons in self.unavailable:
+                    if required_by not in by_required:
+                        by_required[required_by] = []
+                    by_required[required_by].append((pkg, ver, required_cons))
+                for required_by, dependents in by_required.items():
+                    lines.append("  '{}' is not in the resolved set, but declared via ava():".format(required_by))
+                    for pkg, ver, required_cons in dependents[:5]:
+                        cons_str = self._format_constraint(required_cons)
+                        if cons_str and cons_str != "any version":
+                            lines.append("    - {}/{} ava('{}{}')".format(pkg, ver, required_by, cons_str))
+                        else:
+                            lines.append("    - {}/{} ava('{}')".format(pkg, ver, required_by))
+                    if len(dependents) > 5:
+                        lines.append("    ... and {} more packages".format(len(dependents) - 5))
+            else:
+                by_required = {}
+                for pkg, ver, required_by, _ in self.unavailable:
+                    if required_by not in by_required:
+                        by_required[required_by] = 0
+                    by_required[required_by] += 1
+                for required_by, count in list(by_required.items())[:3]:
+                    lines.append(
+                        "  -> [ava] '{}' not present ({} package{} declare ava('{}'))".format(
+                            required_by, count, "s" if count > 1 else "", required_by
+                        )
+                    )
+                if len(by_required) > 3:
+                    lines.append("  -> ... and {} more unmet ava()".format(len(by_required) - 3))
+
+        if self.conflicts:
+            if verbose:
+                lines.append("")
+                lines.append("[ban() - Package Conflicts]")
+                for pkg_a, ver_a, pkg_b, ver_b, reason in self.conflicts:
+                    lines.append("  {}/{} declares ban('{}')".format(pkg_a, ver_a, pkg_b))
+                    lines.append("    -> but {}/{} is selected in the solution".format(pkg_b, ver_b))
+            else:
+                for pkg_a, ver_a, pkg_b, ver_b, reason in self.conflicts[:3]:
+                    lines.append(
+                        "  -> [ban] {}/{} ban('{}') - but {}/{} is selected".format(pkg_a, ver_a, pkg_b, pkg_b, ver_b)
+                    )
+                if len(self.conflicts) > 3:
+                    lines.append("  -> ... and {} more ban() conflicts".format(len(self.conflicts) - 3))
+
+        if self.xor_violations:
+            if verbose:
+                lines.append("")
+                lines.append("[xor() - Exclusive-OR Violations]")
+                for pkg, ver, xor_group, matched in self.xor_violations:
+                    lines.append("  {}/{} declares xor({})".format(pkg, ver, ", ".join(str(g) for g in xor_group)))
+                    lines.append("    -> Expected exactly 1 match, got {}".format(matched))
+            else:
+                for pkg, ver, xor_group, matched in self.xor_violations[:2]:
+                    lines.append(
+                        "  -> [xor] {}/{} xor({}) expects 1 match, got {}".format(
+                            pkg, ver, ", ".join(str(g) for g in xor_group), matched
+                        )
+                    )
+
+        if verbose:
+            if self.rejection_reasons:
+                lines.append("")
+                lines.append("[Solution Rejection Details]")
+                for sol, reason in self.rejection_reasons[:10]:
+                    pkgs_str = ", ".join("{}={}".format(k, v) for k, v in list(sol.items())[:6])
+                    suffix = "..." if len(sol) > 6 else ""
+                    lines.append("  Solution ({}{}): {}".format(pkgs_str, suffix, reason))
+                if len(self.rejection_reasons) > 10:
+                    lines.append("  ... and {} more rejected solutions".format(len(self.rejection_reasons) - 10))
+
+            if self.candidate_versions:
+                relevant_pkgs = set()
+                for pkg, _, _ in self.entry_failures:
+                    relevant_pkgs.add(pkg)
+                for _, _, dep_name, _ in self.missing_deps:
+                    relevant_pkgs.add(dep_name)
+                for pkg, ver, req_by, _ in self.unavailable:
+                    relevant_pkgs.add(pkg)
+                    relevant_pkgs.add(req_by)
+                for pkg_a, _, pkg_b, _, _ in self.conflicts:
+                    relevant_pkgs.add(pkg_a)
+                    relevant_pkgs.add(pkg_b)
+                if not relevant_pkgs:
+                    relevant_pkgs = set(self.candidate_versions.keys())
+                filtered = {k: v for k, v in self.candidate_versions.items() if k in relevant_pkgs}
+                if filtered:
+                    lines.append("")
+                    lines.append("[Candidate Versions]")
+                    for pkg, vers in sorted(filtered.items()):
+                        rendered = self._format_versions(vers) if vers else "<none>"
+                        lines.append("  {}: {}".format(pkg, rendered))
+        else:
+            if not any(
+                [
+                    self.entry_failures,
+                    self.missing_deps,
+                    self.unavailable,
+                    self.conflicts,
+                    self.xor_violations,
+                    self.unsat_core,
+                ]
+            ):
+                lines.append("  -> No single root cause identified; constraints are collectively unsatisfiable")
+            lines.append("  Use '+' separator for full conflict analysis.")
+
+        lines.append("")
+        return "\n".join(lines)
+
+
 class Solver(object):
     def __init__(self, parent, config, environ):
         self.parent = parent
         self.config = config
+        self.environ = environ
+        self.diagnostics = DiagnosticCollector()
         self.enable_sat = False
         try:
             import pysat
@@ -30,82 +326,103 @@ class Solver(object):
         except Exception:
             self.enable_sat = False
 
+    def _diagnostics(self):
+        if not hasattr(self, "diagnostics") or self.diagnostics is None:
+            self.diagnostics = DiagnosticCollector()
+        return self.diagnostics
+
+    def _collect_candidate_versions(self, original_visited):
+        candidate_versions = collections.OrderedDict((pkg, list(vers)) for pkg, vers in original_visited.items())
+        package_state = getattr(self.parent, "package_state", {})
+        available_versions = package_state.get("available", {}) if package_state else {}
+        for name, vers in available_versions.items():
+            if name not in candidate_versions or not candidate_versions[name]:
+                candidate_versions[name] = list(vers)
+        for provider_pkg, ver_dict in self.parent.filters.get("alt", {}).items():
+            for _, raw_alt in ver_dict.items():
+                for pkgs in raw_alt:
+                    name, _, _, _ = self.parent.resolve_argv(pkgs)
+                    if not candidate_versions.get(name):
+                        candidate_versions[name] = []
+                    provider_info = "{}@{}".format(pkgs, provider_pkg)
+                    if provider_info not in candidate_versions[name]:
+                        candidate_versions[name].append(provider_info)
+        return candidate_versions
+
     def collect_verbose_info(self, original_visited):
+        diagnostics = self._diagnostics()
         if self.config.VERBOSE == "+":
-            from pprint import pformat
+            diagnostics.set_candidate_versions(self._collect_candidate_versions(original_visited))
 
-            relation = dict()
-            for pkg, vers in original_visited.items():
-                for ver in vers:
-                    if (pkg, ver) not in relation:
-                        relation[(pkg, ver)] = {}
+        package_graph = getattr(self.parent, "package_graph", {})
+        graphed = package_graph.get("graphed", {})
+        package_state = getattr(self.parent, "package_state", {})
+        initial_names = set(package_state.get("init", [])) if package_state else set()
 
-                    for key in ("req", "ava", "ban", "alt", "xor"):
-                        val = self.parent.resolve_filter(pkg, ver, key)
-                        raw_meta = self.parent.package_graph["graphed"][pkg][ver][key]
-                        all_cons = self.parent.combine_argv([{s: self.parent.resolve_argv(s)} for s in raw_meta])
-                        if val:
-                            relation[(pkg, ver)][key] = raw_meta
-                        if key == "req":
-                            for name, tags in val.items():
-                                if tags:
-                                    continue
-                                dep_cons = all_cons.get(name)
-                                alt_providers = False
-                                if dep_cons:
-                                    alt_providers = self.check_alt_providers(name, dep_cons, original_visited)
-                                if alt_providers:
-                                    continue
-                                if "error" not in relation[(pkg, ver)]:
-                                    relation[(pkg, ver)]["error"] = {}
-                                if "missing" not in relation[(pkg, ver)]["error"]:
-                                    relation[(pkg, ver)]["error"]["missing"] = []
-                                relation[(pkg, ver)]["error"]["missing"].append(name)
-                        elif key == "ava":
-                            for name, tags in val.items():
-                                if tags:
-                                    break
-                                dep_cons = all_cons.get(name)
-                                alt_providers = False
-                                if dep_cons:
-                                    alt_providers = self.check_alt_providers(name, dep_cons, original_visited)
-                                if alt_providers:
-                                    break
-                                if "error" not in relation[(pkg, ver)]:
-                                    relation[(pkg, ver)]["error"] = {}
-                                if "unavailable" not in relation[(pkg, ver)]["error"]:
-                                    relation[(pkg, ver)]["error"]["unavailable"] = []
-                                relation[(pkg, ver)]["error"]["unavailable"].append(name)
-                        elif key == "ban":
-                            for name, tags in val.items():
-                                if tags:
-                                    if "error" not in relation[(pkg, ver)]:
-                                        relation[(pkg, ver)]["error"] = {}
-                                    if "conflict" not in relation[(pkg, ver)]["error"]:
-                                        relation[(pkg, ver)]["error"]["conflict"] = []
-                                    relation[(pkg, ver)]["error"]["conflict"].append(name)
+        for pkg, vers in original_visited.items():
+            if not vers and (not initial_names or pkg in initial_names):
+                diagnostics.add_entry_failure(
+                    pkg,
+                    [],
+                    "No candidate versions were found after applying the requested constraints.",
+                )
+                continue
 
-            for provider_pkg, ver_dict in self.parent.filters["alt"].items():
-                for _, raw_alt in ver_dict.items():
-                    for pkgs in raw_alt:
-                        name, _, _, _ = self.parent.resolve_argv(pkgs)
-                        if not original_visited.get(name):
-                            original_visited[name] = []
-                        original_visited[name].append("{}@{}".format(pkgs, provider_pkg))
-            original_relation = {k: v for k, v in relation.items() if "error" in v}
-            visited_info_str = pformat(dict(original_visited), indent=2, width=80)
-            relation_info_str = pformat(dict(original_relation), indent=2, width=80)
+            for ver in vers:
+                current_meta = graphed.get(pkg, {}).get(ver, {})
 
-            output_message = (
-                "[Visited Packages and Versions]\n"
-                "The solver considered the following packages and versions:\n"
-                "{visited_info}\n\n"
-                "[Relation and Error Info]\n"
-                "The relationships and detected error for each package version are as follows:\n"
-                "{relation_info}\n\n"
-            ).format(visited_info=visited_info_str, relation_info=relation_info_str)
-            sys.stdout.write(output_message)
-            sys.stdout.flush()
+                req_relations = self.parent.resolve_filter(pkg, ver, "req")
+                raw_reqs = current_meta.get("req", [])
+                all_req_cons = self.parent.combine_argv([{s: self.parent.resolve_argv(s)} for s in raw_reqs])
+                for dep_name, dep_tags in req_relations.items():
+                    if dep_tags:
+                        continue
+                    dep_cons = all_req_cons.get(dep_name)
+                    alt_providers = False
+                    if dep_cons:
+                        alt_providers = self.check_alt_providers(dep_name, dep_cons, original_visited)
+                    if not alt_providers:
+                        diagnostics.add_missing_dep(pkg, ver, dep_name, dep_cons)
+
+                ava_relations = self.parent.resolve_filter(pkg, ver, "ava")
+                raw_ava = current_meta.get("ava", [])
+                all_ava_cons = self.parent.combine_argv([{s: self.parent.resolve_argv(s)} for s in raw_ava])
+                if ava_relations:
+                    unsatisfied_ava = []
+                    found_ava_satisfier = False
+                    for dep_name, dep_tags in ava_relations.items():
+                        dep_cons = all_ava_cons.get(dep_name)
+                        if dep_tags:
+                            found_ava_satisfier = True
+                            break
+                        alt_providers = False
+                        if dep_cons:
+                            alt_providers = self.check_alt_providers(dep_name, dep_cons, original_visited)
+                        if alt_providers:
+                            found_ava_satisfier = True
+                            break
+                        unsatisfied_ava.append((dep_name, dep_cons))
+                    if not found_ava_satisfier:
+                        for dep_name, dep_cons in unsatisfied_ava:
+                            diagnostics.add_unavailable(pkg, ver, dep_name, dep_cons)
+
+                ban_relations = self.parent.resolve_filter(pkg, ver, "ban")
+                for dep_name, dep_tags in ban_relations.items():
+                    for dep_ver in dep_tags:
+                        diagnostics.add_conflict(pkg, ver, dep_name, dep_ver, "ban constraint")
+
+                xor_relations = self.parent.resolve_filter(pkg, ver, "xor")
+                raw_xor = current_meta.get("exor", [])
+                for xor_group in raw_xor:
+                    matched_count = 0
+                    for xor_pkg_string in xor_group:
+                        xor_pkg_name, flag, xor_tags, path = self.parent.resolve_argv(xor_pkg_string)
+                        matched_count += len(xor_relations.get(xor_pkg_name, []))
+                        dep_cons = [(flag, xor_tags, path)]
+                        if self.check_alt_providers(xor_pkg_name, dep_cons, original_visited):
+                            matched_count += 1
+                    if xor_group and matched_count == 0:
+                        diagnostics.add_xor_violation(pkg, ver, xor_group, matched_count)
 
     def check_alt_providers(self, dep_name, dep_cons, original_visited):
         for provider_pkg, ver_dict in self.parent.filters["alt"].items():
@@ -138,6 +455,67 @@ class Solver(object):
                         substitutes.append(satisfier_var)
         return list(set(substitutes))
 
+    def record_sat_unsat_core(self, core, rev_var_map):
+        if not core:
+            return []
+        core_entries = []
+        for literal in core:
+            pkg_ver = rev_var_map.get(abs(literal))
+            if not pkg_ver:
+                continue
+            pkg, ver = pkg_ver
+            self._diagnostics().add_unsat_core_entry(pkg, ver)
+            core_entries.append((pkg, ver))
+        return core_entries
+
+    def get_sat_core(self, sat_solver):
+        try:
+            return sat_solver.get_core()
+        except Exception:
+            return []
+
+    def describe_sat_core(self, core, rev_var_map):
+        core_entries = self.record_sat_unsat_core(core, rev_var_map)
+        return ["{}={}".format(pkg, ver) for pkg, ver in core_entries]
+
+    def _infer_version_failure(self, pkg, ver, rel_var_map, locked_solution):
+        """Infer why a specific version cannot be selected when unsat core is empty."""
+        if not rel_var_map:
+            return "has unsatisfiable constraints"
+        rels = rel_var_map.get((pkg, ver))
+        if not rels:
+            return "has unsatisfiable constraints"
+        # Check ava: are required packages missing from visited?
+        ava_issues = []
+        for dep_name, dep_tags in rels.get("ava", {}).items():
+            if not dep_tags:
+                ava_issues.append(dep_name)
+        if ava_issues:
+            return "needs {} present".format(", ".join("'{}'".format(a) for a in ava_issues))
+        # Check req: are required deps missing?
+        req_issues = []
+        for dep_name, dep_tags in rels.get("req", {}).items():
+            if not dep_tags:
+                req_issues.append(dep_name)
+        if req_issues:
+            return "requires {} (not available)".format(", ".join("'{}'".format(r) for r in req_issues))
+        # Check ban: does it conflict with locked entries?
+        ban_issues = []
+        for dep_name, dep_tags in rels.get("ban", {}).items():
+            if dep_name in locked_solution and locked_solution[dep_name] in dep_tags:
+                ban_issues.append("{}={}".format(dep_name, locked_solution[dep_name]))
+        if ban_issues:
+            return "conflicts with {}".format(", ".join(ban_issues))
+        return "has dependencies with unsatisfiable constraints (see below)"
+
+    def collect_sat_unsat_core(self, constraints, assumptions, rev_var_map):
+        from pysat.solvers import Solver as SATSolver
+
+        with SATSolver(bootstrap_with=constraints) as sat_solver:
+            if sat_solver.solve(assumptions=assumptions or []):
+                return []
+            return self.record_sat_unsat_core(self.get_sat_core(sat_solver), rev_var_map)
+
     def collect_limit_versions(self, visited, max_versions_limit, min_versions_limit, level_info):
         result = dict()
         for pkg, vers in visited.items():
@@ -155,8 +533,11 @@ class Solver(object):
         return result
 
     def collect_progressively_solve(self, entry_names, solver_function, fallback_solver_function=None):
-        min_versions_limit = 5
-        max_versions_limit = 10
+        try:
+            max_versions_limit = int(self.environ(self.config.Env.PACKAGE_TAGS).getenv())
+        except (AttributeError, TypeError):
+            max_versions_limit = 10
+        min_versions_limit = max(1, max_versions_limit // 2)
 
         if fallback_solver_function is None:
             fallback_solver_function = solver_function
@@ -189,14 +570,15 @@ class Solver(object):
                     best_objective = objective
                 if objective[0] == optimal_signature:
                     return solution
+        if best_solution:
+            return best_solution
         solution = fallback_solver_function(entry_names, visited=original_visited)
         if solution:
             return solution
-        if best_solution:
-            return best_solution
         self.collect_verbose_info(original_visited)
 
     def collect_solution(self, entry_names):
+        self.diagnostics = DiagnosticCollector()
         if self.enable_sat:
             best_solution = self.collect_progressively_solve(entry_names, self.build_solution_sat)
         else:
@@ -210,7 +592,9 @@ class Solver(object):
         var_map, rev_var_map, rel_var_map = self.build_map_data(visited)
         constraints = self.build_constraints(entry_names, var_map, rel_var_map, visited)
         levels = self.build_levels(entry_names, visited)
-        locked_entries = self.build_entry_solution_sat(entry_names, visited, var_map, constraints)
+        locked_entries = self.build_entry_solution_sat(
+            entry_names, visited, var_map, constraints, rev_var_map, rel_var_map
+        )
         if locked_entries is None:
             return None
         entry_assumptions = [var_map[(pkg, ver)] for pkg, ver in locked_entries.items() if (pkg, ver) in var_map]
@@ -230,6 +614,8 @@ class Solver(object):
 
         if not solution_weights:
             model = self.build_sat_model(constraints, assumptions=entry_assumptions)
+            if model is None:
+                self.collect_sat_unsat_core(constraints, entry_assumptions, rev_var_map)
             return self.build_solution_from_model(model, rev_var_map, entry_names, rel_var_map, levels)
 
         wcnf = WCNF()
@@ -243,6 +629,8 @@ class Solver(object):
                 wcnf.append([var], soft_weights[var])
         with RC2(wcnf) as rc2_solver:
             model = rc2_solver.compute()
+            if model is None:
+                self.collect_sat_unsat_core(constraints, entry_assumptions, rev_var_map)
             return self.build_solution_from_model(model, rev_var_map, entry_names, rel_var_map, levels)
 
     def build_sat_model(self, constraints, assumptions=None):
@@ -286,27 +674,54 @@ class Solver(object):
                 feasible_versions[pkg] = allowed_versions
         return feasible_versions
 
-    def build_entry_solution_sat(self, entry_names, visited, var_map, constraints):
+    def build_entry_solution_sat(self, entry_names, visited, var_map, constraints, rev_var_map=None, rel_var_map=None):
         from pysat.solvers import Solver as SATSolver
 
+        if rev_var_map is None:
+            rev_var_map = {var: pkg_ver for pkg_ver, var in var_map.items()}
         locked_solution = collections.OrderedDict()
         assumptions = []
         with SATSolver(bootstrap_with=constraints) as sat_solver:
             for name in entry_names:
                 versions = self.parent.custom_sort(visited.get(name, []))
                 if not versions:
+                    self._diagnostics().add_entry_failure(
+                        name, [], "No candidate versions found for this entry package."
+                    )
                     return None
                 chosen_version = None
+                tried_versions = []
+                version_reasons = []
                 for version in reversed(versions):
+                    tried_versions.append(version)
                     sat_var = var_map.get((name, version))
                     if sat_var is None:
+                        version_reasons.append("{} is not present in the SAT variable map".format(version))
                         continue
                     if sat_solver.solve(assumptions=assumptions + [sat_var]):
                         assumptions.append(sat_var)
                         locked_solution[name] = version
                         chosen_version = version
+                        # Warn if we skipped higher versions (downgrade)
+                        if tried_versions[:-1]:  # there were skipped versions before this one
+                            skipped = tried_versions[:-1]
+                            reasons_for_skipped = version_reasons[: len(skipped)]
+                            self._diagnostics().add_downgrade(name, skipped, chosen_version, reasons_for_skipped)
                         break
+                    core_description = self.describe_sat_core(self.get_sat_core(sat_solver), rev_var_map)
+                    # Filter out self-references from core (not useful)
+                    core_description = [c for c in core_description if not c.startswith("{}=".format(name))]
+                    if core_description:
+                        version_reasons.append("{} conflicts with {}".format(version, ", ".join(core_description)))
+                    else:
+                        # Try to infer reason from package relations
+                        inferred = self._infer_version_failure(name, version, rel_var_map, locked_solution)
+                        version_reasons.append("{} {}".format(version, inferred))
                 if chosen_version is None:
+                    reason = "; ".join(version_reasons)
+                    if not reason:
+                        reason = "All candidate versions conflict with already locked entries or package constraints."
+                    self._diagnostics().add_entry_failure(name, tried_versions, reason)
                     return None
         return locked_solution
 
@@ -675,7 +1090,15 @@ class Solver(object):
                         dep_cons = all_req_cons.get(dep_name)
                         if dep_cons and self.check_alt_providers(dep_name, dep_cons, selected_visited):
                             continue
-                        return False
+                        self._diagnostics().add_missing_dep(name, tags, dep_name, dep_cons)
+                        selected_version = sol.get(dep_name)
+                        if selected_version:
+                            reason = (
+                                "{}/{} requires '{}' but selected version '{}' does not match the constraint"
+                            ).format(name, tags, dep_name, selected_version)
+                        else:
+                            reason = "{}/{} requires '{}' but it is not selected".format(name, tags, dep_name)
+                        return False, reason
 
                 resolve_ava = self.parent.resolve_filter(name, tags, "ava")
                 if not resolve_ava:
@@ -684,6 +1107,7 @@ class Solver(object):
                     raw_ava = current_meta.get("ava", [])
                     all_ava_cons = self.parent.combine_argv([{s: self.parent.resolve_argv(s)} for s in raw_ava])
                     found_one_valid_ava = False
+                    unsatisfied_ava = []
                     for dep_name, dep_tags_list in resolve_ava.items():
                         if dep_name in sol and sol[dep_name] in dep_tags_list:
                             found_one_valid_ava = True
@@ -692,13 +1116,22 @@ class Solver(object):
                         if dep_cons and self.check_alt_providers(dep_name, dep_cons, selected_visited):
                             found_one_valid_ava = True
                             break
+                        unsatisfied_ava.append((dep_name, dep_cons))
                     if not found_one_valid_ava:
-                        return False
+                        for dep_name, dep_cons in unsatisfied_ava:
+                            self._diagnostics().add_unavailable(name, tags, dep_name, dep_cons)
+                        reason = "{}/{} requires at least one ava() relation, but none are satisfied".format(
+                            name,
+                            tags,
+                        )
+                        return False, reason
 
                 resolve_ban = self.parent.resolve_filter(name, tags, "ban")
                 for dep_name, dep_tags_list in resolve_ban.items():
                     if dep_name in sol and sol[dep_name] in dep_tags_list:
-                        return False
+                        self._diagnostics().add_conflict(name, tags, dep_name, sol[dep_name], "ban constraint")
+                        reason = "{}/{} bans {}/{}".format(name, tags, dep_name, sol[dep_name])
+                        return False, reason
 
                 resolve_xor = self.parent.resolve_filter(name, tags, "xor")
                 raw_xor = current_meta.get("exor", [])
@@ -714,8 +1147,15 @@ class Solver(object):
                         if self.check_alt_providers(xor_pkg_name, dep_cons, selected_visited):
                             matched_count += 1
                     if raw_xor and matched_count != 1:
-                        return False
-            return True
+                        self._diagnostics().add_xor_violation(name, tags, xor_group, matched_count)
+                        reason = "{}/{} requires exactly one xor() match from [{}], got {}".format(
+                            name,
+                            tags,
+                            ", ".join(xor_group),
+                            matched_count,
+                        )
+                        return False, reason
+            return True, None
 
         valid_solutions = list()
         for sol in solutions:
@@ -724,8 +1164,11 @@ class Solver(object):
                 val_solution.update(sol)
             else:
                 val_solution = sol
-            if is_valid_solution(self, val_solution):
+            is_valid, rejection_reason = is_valid_solution(self, val_solution)
+            if is_valid:
                 valid_solutions.append(sol)
+            elif rejection_reason:
+                self._diagnostics().add_rejection(val_solution, rejection_reason)
         return valid_solutions
 
 
@@ -1001,7 +1444,8 @@ class APIClient(Client):
             return
         from requests import adapters, Session
 
-        adapter = adapters.HTTPAdapter(pool_connections=3, pool_maxsize=300, max_retries=3)
+        self.metadata_timeout = 1.0
+        adapter = adapters.HTTPAdapter(pool_connections=3, pool_maxsize=300, max_retries=0)
         self.client = Session()
         self.client.mount("http://", adapter)
         self.client.mount("https://", adapter)
@@ -1016,41 +1460,43 @@ class APIClient(Client):
             scheme=self.scheme, netloc=self.netloc, bucket=self.bucket
         )
 
-    @lru_cache()
-    def get_nodes(self):
+    def _get_json_list(self, url_path, key):
         try:
-            url = "{base_url}/nodes/names".format(base_url=self.base_url)
-            response = self.client.get(url)
+            url = "{}/{}".format(self.base_url, url_path)
+            response = self.client.get(url, timeout=self.metadata_timeout)
             response.raise_for_status()
-            result = response.json()
-            value = result.get("names")
-            if value is None:
-                return list()
-            return list(value)
+            value = response.json().get(key)
+            return list(value) if value is not None else list()
         except Exception:
             self._message("API unavailable fallback to local mode")
             return list()
 
     @lru_cache()
+    def get_nodes(self):
+        return self._get_json_list("nodes/names", "names")
+
+    @lru_cache()
     def get_tags(self, name):
+        return self._get_json_list("nodes/{}/tags".format(name), "tags")
+
+    def get_batch_tags(self, names):
+        """Batch query: get tags for multiple packages in one request.
+        Returns dict {name: [tags]} or empty dict on failure.
+        """
         try:
-            url = "{base_url}/nodes/{name}/tags".format(base_url=self.base_url, name=name)
-            response = self.client.get(url)
+            url = "{base_url}/nodes/batch/tags".format(base_url=self.base_url)
+            response = self.client.post(url, json={"names": names}, timeout=self.metadata_timeout * 2)
             response.raise_for_status()
             result = response.json()
-            value = result.get("tags")
-            if value is None:
-                return list()
-            return list(value)
+            return result.get("results", {})
         except Exception:
-            self._message("API unavailable fallback to local mode")
-            return list()
+            return {}
 
     @lru_cache()
     def get_node_properties(self, name, tags):
         try:
             url = "{base_url}/nodes/{name}/{tags}".format(base_url=self.base_url, name=name, tags=tags)
-            response = self.client.get(url)
+            response = self.client.get(url, timeout=self.metadata_timeout)
             response.raise_for_status()
             result = response.json()
             return result.get("properties", {})
@@ -1069,7 +1515,7 @@ class APIClient(Client):
     def set_info(self, name, tags):
         try:
             url = "{base_url}/nodes/{name}/{tags}".format(base_url=self.base_url, name=name, tags=tags)
-            response = self.client.post(url)
+            response = self.client.post(url, timeout=self.metadata_timeout)
             response.raise_for_status()
             return response.json()
         except Exception:
@@ -1079,7 +1525,7 @@ class APIClient(Client):
     def exec_cql(self, cql):
         try:
             url = "{base_url}/cypher/exec".format(base_url=self.base_url)
-            response = self.client.post(url, json={"cql": cql})
+            response = self.client.post(url, json={"cql": cql}, timeout=self.metadata_timeout)
             result = response.json()
             if "error" in result:
                 error_info = "exec: %s error:%s" % (cql, result.get("error"))
@@ -1259,8 +1705,7 @@ class DBManage(object):
     def __init_db(self):
         try:
             with self.__get_db() as (db, cursor):
-                cursor.execute(
-                    """
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS caches (
                         name TEXT,
                         tags TEXT,
@@ -1268,8 +1713,7 @@ class DBManage(object):
                         timestamp INTEGER,
                         PRIMARY KEY (name, tags)
                     )
-                """
-                )
+                """)
                 db.commit()
                 return True
         except sqlite3.Error as e:
@@ -1378,7 +1822,10 @@ class Syncer(object):
         try:
             import minio
             import requests
-        except ImportError:
+        except ImportError as e:
+            if config.VERBOSE == "+":
+                sys.stdout.write("Info: Syncer unavailable ({})\n".format(e))
+                sys.stdout.flush()
             return None
         instance.config = config
         instance.environ = environ
@@ -1415,8 +1862,30 @@ class Syncer(object):
         return APIClient(url, self.config, self.environ)
 
     def get_tags(self, name):
+        # Lazy batch prefetch: first call triggers bulk fetch of all known packages
+        if not hasattr(self, "_tags_cache"):
+            self._tags_cache = {}
+            self._tags_prefetched = False
+        if not self._tags_prefetched:
+            self._tags_prefetched = True
+            all_names = self.first_api_client("get_nodes")
+            if all_names:
+                batch_result = self.first_api_client("get_batch_tags", all_names)
+                if isinstance(batch_result, dict):
+                    self._tags_cache = batch_result
+        if name in self._tags_cache:
+            return self._tags_cache[name]
+        # Fallback to single query for packages not in prefetch
         result = self.first_api_client("get_tags", name)
+        self._tags_cache[name] = result
         return result
+
+    def get_batch_tags(self, names):
+        """Batch query: get tags for multiple packages in one request."""
+        result = self.first_api_client("get_batch_tags", names)
+        if isinstance(result, dict):
+            return result
+        return {}
 
     def get_args(self, name, tags, args):
         result = self.first_api_client("get_args", name, tags, args)
@@ -1435,7 +1904,10 @@ class Syncer(object):
         except Exception:
             pass
         main_env_value = self.config.Env.RESTAPI_URL
+        deadline = time.time() + 3.0  # total timeout for all fallback attempts
         for i in range(1, self.max_client + 1):
+            if time.time() > deadline:
+                break
             api_env_value = self.environ(main_env_value + str(i)).getenv()
             if not api_env_value:
                 continue
@@ -1451,6 +1923,28 @@ class Syncer(object):
                 continue
         return list()
 
+    def first_s3_client(self, method_name, *args, **kwargs):
+        """Try primary S3 client, then fallback to numbered alternates."""
+        try:
+            result = getattr(self.s3_client, method_name)(*args, **kwargs)
+            return result, self.s3_client
+        except Exception:
+            pass
+        main_env_value = self.config.Env.STORAGE_URL
+        for i in range(1, self.max_client + 1):
+            s3_env_value = self.environ(main_env_value + str(i)).getenv()
+            if not s3_env_value:
+                continue
+            new_s3_client = S3Client(s3_env_value, self.config, self.environ)
+            if new_s3_client.logged is False:
+                continue
+            try:
+                result = getattr(new_s3_client, method_name)(*args, **kwargs)
+                return result, new_s3_client
+            except Exception:
+                continue
+        return None, None
+
     def sync_pkgs(self, path):
         self.src_pkg = None
         this = self.thispath(path)
@@ -1464,32 +1958,14 @@ class Syncer(object):
             src_pkg = self.get_args(name, tags, "src")
         if not src_pkg:
             return False
-
-        try:
-            src_etag = self.s3_client.get_etag(src_pkg)
-            self.cache_pkgs(name, tags, root, src_pkg, src_etag)
-            return True
-        except Exception:
-            main_env_value = self.config.Env.STORAGE_URL
-            for i in range(1, self.max_client + 1):
-                s3_env_value = self.environ(main_env_value + str(i)).getenv()
-                if not s3_env_value:
-                    continue
-                new_s3_client = S3Client(s3_env_value, self.config, self.environ)
-                if new_s3_client.logged is False:
-                    continue
-                try:
-                    src_etag = new_s3_client.get_etag(src_pkg)
-                    self.cache_pkgs(name, tags, root, src_pkg, src_etag, new_s3_client)
-                    return True
-                except Exception:
-                    continue
+        src_etag, s3_client = self.first_s3_client("get_etag", src_pkg)
+        if src_etag is None:
             return False
+        self.cache_pkgs(name, tags, root, src_pkg, src_etag, s3_client)
+        return True
 
-    def cache_pkgs(self, name, tags, root, src_pkg, src_etag, new_s3_client=None):
-        if new_s3_client:
-            s3_client = new_s3_client
-        else:
+    def cache_pkgs(self, name, tags, root, src_pkg, src_etag, s3_client=None):
+        if not s3_client:
             s3_client = self.s3_client
         base_path = os.path.dirname(root)
         tar_pkg = root + ".pkg"
@@ -1524,25 +2000,9 @@ class Syncer(object):
         self.src_pkg = src_pkg
         if os.path.exists(root):
             tar_etag = self.dbmanage.query_db_etag(name, tags)
-            try:
-                src_etag = self.s3_client.get_etag(self.src_pkg)
-                if tar_etag == src_etag:
-                    return False
-            finally:
-                main_env_value = self.config.Env.STORAGE_URL
-                for i in range(1, self.max_client + 1):
-                    s3_env_value = self.environ(main_env_value + str(i)).getenv()
-                    if not s3_env_value:
-                        continue
-                    new_s3_client = S3Client(s3_env_value, self.config, self.environ)
-                    if new_s3_client.logged is False:
-                        continue
-                    try:
-                        src_etag = new_s3_client.get_etag(self.src_pkg)
-                        if tar_etag == src_etag:
-                            return False
-                    except Exception:
-                        continue
+            src_etag, _ = self.first_s3_client("get_etag", self.src_pkg)
+            if src_etag is not None and tar_etag == src_etag:
+                return False
         temp_tags = "." + tags + "." + uuid.uuid1().hex
         temp_root = os.path.join(base_path, temp_tags)
         try:

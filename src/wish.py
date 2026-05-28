@@ -59,6 +59,8 @@ class Config(object):
         DEVELOP_MODE = "WISH_DEVELOP_MODE"
         OFFLINE_MODE = "WISH_OFFLINE_MODE"
         INHERIT_MODE = "WISH_INHERIT_MODE"
+
+        PACKAGE_TAGS = "WISH_PACKAGE_TAGS"
         PACKAGE_EXTRA = "WISH_PACKAGE_EXTRA"
 
     class Msg(object):
@@ -144,6 +146,16 @@ class Config(object):
             sys.stderr.write(message)
             sys.stderr.flush()
             sys.exit(error_info["code"])
+
+        @classmethod
+        def warn(cls, message):
+            sys.stderr.write(f"Warning: {message}\n")
+            sys.stderr.flush()
+
+        @classmethod
+        def info(cls, message):
+            sys.stderr.write(f"{message}\n")
+            sys.stderr.flush()
 
 
 class Environ(object):
@@ -282,17 +294,32 @@ class Resolve(object):
             "init": list(),
             "args": list(),
             "adap": list(),
+            "available": collections.OrderedDict(),
         }
+
+        self._resolve_argv_cache = dict()
+        self._version_key_cache = dict()
+        self._parse_argv_cache = dict()
+        self._package_calls_cache = dict()
+        self._resolve_filter_cache = dict()
+        self._safe_exists_true_cache = set()
 
     def safe_open(self, path):
         with open(path, "r", encoding="utf-8") as file:
-            content = file.read()
-            return content
+            return file.read()
+
+    def filter_result(self, resolve_dict):
+        return {key: tuple(value) for key, value in resolve_dict.items()}
 
     def safe_exists(self, path):
+        if path in self._safe_exists_true_cache:
+            return True
         if not os.path.exists(path):
             return False
-        return os.path.realpath(path) == path
+        exists = os.path.realpath(path) == path
+        if exists:
+            self._safe_exists_true_cache.add(path)
+        return exists
 
     def custom_sort(self, tags_list):
         def key_func(tag):
@@ -326,15 +353,12 @@ class Resolve(object):
         comb_dict = dict()
         for i in pkgs:
             for _, (name, flag, tags, path) in i.items():
-                if name in comb_dict:
-                    comb_list = comb_dict[name]
-                else:
-                    comb_list = list()
+                comb_list = comb_dict.get(name, list())
                 comb_list.append((flag, tags, path))
-                comb_dict[name] = self.prioriy_flag(comb_list)
+                comb_dict[name] = self.priority_flag(comb_list)
         return comb_dict
 
-    def prioriy_flag(self, clist):
+    def priority_flag(self, clist):
         seen = set()
         clist = [i for i in clist if i not in seen and not seen.add(i)]
         prioriy = [(flag, tags, path) for (flag, tags, path) in clist if path]
@@ -352,6 +376,9 @@ class Resolve(object):
             return prioriy
 
     def resolve_argv(self, argv):
+        cached = self._resolve_argv_cache.get(argv)
+        if cached is not None:
+            return cached
         resolve_list = argv.split("@", 1)
         name = resolve_list.pop(0)
         flag, tags = None, None
@@ -362,11 +389,16 @@ class Resolve(object):
                 name, tags = name.split(flag_str, 1)
                 flag = flag_str
                 break
-        return name, flag, tags, path
+        result = (name, flag, tags, path)
+        self._resolve_argv_cache[argv] = result
+        return result
 
     def version_key(self, tags):
         if tags is None:
             return
+        cached = self._version_key_cache.get(tags)
+        if cached is not None:
+            return list(cached)
         processed_parts = list()
         current_num = ""
         current_str = ""
@@ -387,6 +419,7 @@ class Resolve(object):
             processed_parts.append((1, int(current_num)))
         if current_str:
             processed_parts.append((0, current_str))
+        self._version_key_cache[tags] = tuple(processed_parts)
         return processed_parts
 
     def calculate_prefix_key(self, version_key):
@@ -557,18 +590,20 @@ class Acquire(Resolve):
                 Config.Msg.error("CONFIG_ERROR", path, err)
 
     def parse_argv(self, path, argv, extend=True):
+        cache_key = (path, argv, extend)
+        cached = self._parse_argv_cache.get(cache_key)
+        if cached is not None:
+            return [list(item) if isinstance(item, list) else item for item in cached]
         result = list()
 
         if self.safe_exists(path):
             try:
-                tree = ast.parse(self.safe_open(path))
-                extractor = Extractor(argv)
-                extractor.visit(tree)
-                for call in extractor.calls:
+                package_calls = self.package_calls(path)
+                for call_args in package_calls.get(argv, list()):
                     if extend:
-                        result.extend([ast.literal_eval(arg) for arg in call.args])
+                        result.extend(call_args)
                     else:
-                        result.append([ast.literal_eval(arg) for arg in call.args])
+                        result.append(list(call_args))
             except Exception:
                 err = "".join(traceback.format_exception(*sys.exc_info()))
                 Config.Msg.error("CONFIG_ERROR", path, err)
@@ -582,7 +617,22 @@ class Acquire(Resolve):
                     result.append(self.syncer.get_args(name, tags, argv))
             else:
                 Config.Msg.error("NETWORK_ERROR", argv, name, tags)
+        self._parse_argv_cache[cache_key] = [list(item) if isinstance(item, list) else item for item in result]
         return result
+
+    def package_calls(self, path):
+        cached = self._package_calls_cache.get(path)
+        if cached is not None:
+            return cached
+        tree = ast.parse(self.safe_open(path))
+        calls = {name: list() for name in ("req", "ava", "ext", "ban", "alt", "xor")}
+        extractor = Extractor(*calls.keys())
+        extractor.visit(tree)
+        for call in extractor.calls:
+            call_name = call.func.id
+            calls[call_name].append([ast.literal_eval(arg) for arg in call.args])
+        self._package_calls_cache[path] = calls
+        return calls
 
     def resolve_spec(self, name, path):
         flag, tags = None, None
@@ -642,6 +692,10 @@ class Acquire(Resolve):
         return resolve_dict
 
     def resolve_filter(self, name, tags, key):
+        cache_key = (name, tags, key)
+        cached = self._resolve_filter_cache.get(cache_key)
+        if cached is not None:
+            return cached
         resolve_dict = dict()
         key_filter = self.filters[key]
         platform_info = Config.Platform()
@@ -651,7 +705,7 @@ class Acquire(Resolve):
             for kname, kcons in pkgs.items():
                 if kname in platform_info:
                     if not self.resolve_architecture(kname, kcons, platform_info):
-                        return {kname: list()}
+                        return self.filter_result({kname: list()})
                     continue
                 if key in ("alt",):
                     resolve_dict[kname] = kcons
@@ -667,7 +721,9 @@ class Acquire(Resolve):
                     group_cons = self.group_ranges(kcons)
                     ktags_list = self.match_ranges(ktags_list, group_cons)
                 resolve_dict[kname] = ktags_list
-        return resolve_dict
+        frozen_result = self.filter_result(resolve_dict)
+        self._resolve_filter_cache[cache_key] = frozen_result
+        return frozen_result
 
     def update_filter(self, name, tags, key):
         if name not in self.package_graph["graphed"]:
@@ -680,6 +736,7 @@ class Acquire(Resolve):
             self.filters[key][name][tags] = self.package_graph["graphed"][name][tags][key]
 
     def build_filter(self, name_list=None):
+        self._resolve_filter_cache.clear()
         if name_list is None:
             name_list = list(self.package_graph["visited"].keys())
         for name in name_list:
@@ -778,11 +835,20 @@ class Require(Acquire):
                 self.package_graph["visited"][name] = list()
             vers = self.combine_cons([self.resolve_cons(name, *co) for co in cons])
             if name in self.package_graph["initial"]:
+                # Record all available versions BEFORE constraint filtering
+                all_vers = self.combine_cons([self.resolve_cons(name, None, None, co[2]) for co in cons])
+                self.package_state["available"][name] = self.custom_sort(list(all_vers.keys()))
                 init_cons = self.package_graph["initial"][name]
                 valid_tags = list(vers.keys())
                 for con_flag, con_tags, _ in init_cons:
                     valid_tags = self.resolve_tags(con_flag, con_tags, valid_tags)
                 vers = {t: p for t, p in vers.items() if t in valid_tags}
+
+            limit_tags = int(Environ(Config.Env.PACKAGE_TAGS).getenv())
+            if len(vers) > limit_tags:
+                sorted_tags = self.custom_sort(list(vers.keys()))
+                keep_tags = sorted_tags[-limit_tags:]
+                vers = {t: p for t, p in vers.items() if t in keep_tags}
 
             for tags, paths in vers.items():
                 path = os.path.join(paths[-1], tags, Config.PACKAGE_NAME)
@@ -818,23 +884,15 @@ class Require(Acquire):
                     self.resolve_pkgs(xors)
 
     def vis_extra(self, exts, name, tags):
-
         enable_extra_pkgs = Environ(Config.Env.PACKAGE_EXTRA).envlist()
         for args in exts:
             if "@" in args:
-                if self.package_graph["pending"].get(name) is None:
-                    self.package_graph["pending"][name] = dict()
-                if self.package_graph["pending"][name].get(tags) is None:
-                    self.package_graph["pending"][name][tags] = list()
-                self.package_graph["pending"][name][tags].append(args)
+                target = name
             else:
-                ext_name = self.resolve_argv(args)[0]
-                if ext_name in enable_extra_pkgs:
-                    if self.package_graph["pending"].get(ext_name) is None:
-                        self.package_graph["pending"][ext_name] = dict()
-                    if self.package_graph["pending"][ext_name].get(tags) is None:
-                        self.package_graph["pending"][ext_name][tags] = list()
-                    self.package_graph["pending"][ext_name][tags].append(args)
+                target = self.resolve_argv(args)[0]
+                if target not in enable_extra_pkgs:
+                    continue
+            self.package_graph["pending"].setdefault(target, {}).setdefault(tags, []).append(args)
 
     def resolve_platform(self, args):
         platform_info = Config.Platform()
@@ -851,49 +909,94 @@ class Require(Acquire):
                 return False
         return True
 
+    def emit_solver_diagnostics(self):
+        diagnostics = getattr(getattr(self, "solver", None), "diagnostics", None)
+        if diagnostics and diagnostics.has_diagnostics():
+            Config.Msg.info(diagnostics.format_report(verbose=(Config.VERBOSE == "+")))
+
+    def _emit_downgrade_warnings(self):
+        if Config.VERBOSE != "+":
+            return
+        diagnostics = getattr(getattr(self, "solver", None), "diagnostics", None)
+        if not diagnostics or not diagnostics.downgrades:
+            return
+        for pkg, skipped, chosen, reasons in diagnostics.downgrades:
+            Config.Msg.warn(
+                "'{}' downgraded to {} (skipped: {})".format(pkg, chosen, ", ".join(str(v) for v in skipped))
+            )
+            for reason in reasons:
+                Config.Msg.warn("  {}".format(reason))
+
     def resolve_pending(self, solution):
         sub_solution = collections.OrderedDict()
-        filter_pending = list()
-        for name, tags in solution.items():
-            if name not in self.package_graph["pending"]:
-                continue
-            if tags not in self.package_graph["pending"][name]:
-                continue
-            filter_pending.extend(self.package_graph["pending"][name][tags])
+        pending_solution = collections.OrderedDict(solution)
+        processed_pending = set()
 
-        args = list()
-        enas = collections.OrderedDict()
-        for argv in filter_pending:
-            if "@" in argv:
-                argv, enav = argv.split("@")
-                if enas.get(argv) is None:
-                    enas[argv] = list()
-                enas[argv].append(enav)
-            else:
-                args.append(argv)
+        while True:
+            filter_pending = list()
+            for name, tags in pending_solution.items():
+                if name not in self.package_graph["pending"]:
+                    continue
+                if tags not in self.package_graph["pending"][name]:
+                    continue
+                for argv in self.package_graph["pending"][name][tags]:
+                    pending_key = (name, tags, argv)
+                    if pending_key in processed_pending:
+                        continue
+                    filter_pending.append(pending_key)
 
-        platform_info = Config.Platform()
-        for ext_name, ext_env in enas.items():
-            env_pkgs = self.combine_argv([{argv: self.resolve_argv(argv)} for argv in ext_env])
-            for name, cons in env_pkgs.items():
-                if name in platform_info:
-                    if self.resolve_architecture(name, cons, platform_info):
-                        args.append(ext_name)
-                elif name in solution.keys():
-                    tags_list = [solution[name]]
-                    for c in cons:
-                        tags_list = self.resolve_tags(c[0], c[1], tags_list)
-                    if tags_list:
-                        args.append(ext_name)
+            args = list()
+            enas = collections.OrderedDict()
+            for pending_key in filter_pending:
+                _, _, argv = pending_key
+                if "@" in argv:
+                    argv, enav = argv.split("@", 1)
+                    if enas.get(argv) is None:
+                        enas[argv] = list()
+                    enas[argv].append((enav, pending_key))
                 else:
-                    for sol_name, sol_ver in solution.items():
-                        alt_dict = self.resolve_filter(sol_name, sol_ver, "alt")
-                        if name in alt_dict:
-                            alt_cons = alt_dict[name]
-                            if self.rules_compatible(cons, alt_cons):
-                                args.append(ext_name)
-        if args:
+                    ext_name = self.resolve_argv(argv)[0]
+                    if ext_name not in pending_solution:
+                        args.append(argv)
+                    processed_pending.add(pending_key)
+
+            platform_info = Config.Platform()
+            for ext_name, ext_env in enas.items():
+                ext_conditions = [enav for enav, _ in ext_env]
+                env_pkgs = self.combine_argv([{argv: self.resolve_argv(argv)} for argv in ext_conditions])
+                activate_ext = False
+                for name, cons in env_pkgs.items():
+                    if name in platform_info:
+                        if self.resolve_architecture(name, cons, platform_info):
+                            activate_ext = True
+                    elif name in pending_solution.keys():
+                        tags_list = [pending_solution[name]]
+                        for c in cons:
+                            tags_list = self.resolve_tags(c[0], c[1], tags_list)
+                        if tags_list:
+                            activate_ext = True
+                    else:
+                        for sol_name, sol_ver in pending_solution.items():
+                            alt_dict = self.resolve_filter(sol_name, sol_ver, "alt")
+                            if name in alt_dict:
+                                alt_cons = alt_dict[name]
+                                if self.rules_compatible(cons, alt_cons):
+                                    activate_ext = True
+                    if activate_ext:
+                        break
+                if activate_ext:
+                    if ext_name not in pending_solution:
+                        args.append(ext_name)
+                    for _, pending_key in ext_env:
+                        processed_pending.add(pending_key)
+
+            args = list(collections.OrderedDict((arg, None) for arg in args).keys())
+            if not args:
+                break
+            before_visited = set(self.package_graph["visited"].keys())
             self.resolve_pkgs(args)
+            after_visited = set(self.package_graph["visited"].keys())
+            new_visited_names = list(after_visited - before_visited)
             pkgs = self.combine_argv([{argv: self.resolve_argv(argv)} for argv in args])
             names = list(pkgs.keys())
             for name in names:
@@ -901,11 +1004,97 @@ class Require(Acquire):
                     Config.Msg.error("PENDING_ERROR", name, pkgs.get(name))
                 if not self.package_graph["visited"][name]:
                     Config.Msg.error("PENDING_ERROR", name, pkgs.get(name))
-            self.build_filter(names)
-            sub_solution = self.solver.collect_solution(names)
-            if not sub_solution:
+            self.build_filter(new_visited_names)
+            # Lock main solution versions in visited so sub-solve respects them
+            saved_visited = {}
+            for sol_name, sol_tags in pending_solution.items():
+                if sol_name in self.package_graph["visited"] and len(self.package_graph["visited"][sol_name]) > 1:
+                    saved_visited[sol_name] = self.package_graph["visited"][sol_name]
+                    self.package_graph["visited"][sol_name] = [sol_tags]
+            step_solution = self.solver.collect_solution(names)
+            # Restore visited
+            for sol_name, sol_vers in saved_visited.items():
+                self.package_graph["visited"][sol_name] = sol_vers
+            if not step_solution:
+                self.emit_solver_diagnostics()
                 Config.Msg.error("RESOLVE_ERROR", names)
+
+            new_solution = collections.OrderedDict(
+                (name, tags) for name, tags in step_solution.items() if pending_solution.get(name) != tags
+            )
+            if not new_solution:
+                break
+            sub_solution.update(new_solution)
+            pending_solution = collections.OrderedDict({**new_solution, **pending_solution})
         return sub_solution
+
+    def collect_unresolved_ava_names(self):
+        missing_names = set()
+        for name, tags_dict in self.package_graph["graphed"].items():
+            if name not in self.package_graph["initial"]:
+                continue
+            for tags, meta in tags_dict.items():
+                for argv in meta["ava"]:
+                    ava_name = self.resolve_argv(argv)[0]
+                    if ava_name in Config.Platform():
+                        continue
+                    if ava_name not in self.package_graph["visited"]:
+                        missing_names.add(ava_name)
+        return missing_names
+
+    def resolve_pending_candidates(self):
+        target_names = self.collect_unresolved_ava_names()
+        if not target_names:
+            return
+        processed_pending = set()
+        while True:
+            args = list()
+            for name, tags_dict in self.package_graph["pending"].items():
+                visited_tags = self.package_graph["visited"].get(name, list())
+                for tags in visited_tags:
+                    if tags not in tags_dict:
+                        continue
+                    for argv in tags_dict[tags]:
+                        pending_key = (name, tags, argv)
+                        if pending_key in processed_pending:
+                            continue
+                        processed_pending.add(pending_key)
+                        if "@" in argv:
+                            ext_name, ext_env = argv.split("@", 1)
+                            if ext_name not in target_names:
+                                continue
+                            if self.resolve_pending_candidate_env(ext_env):
+                                args.append(ext_name)
+                        else:
+                            ext_name = self.resolve_argv(argv)[0]
+                            if ext_name not in target_names:
+                                continue
+                            if ext_name in Environ(Config.Env.PACKAGE_EXTRA).envlist():
+                                args.append(argv)
+            args = list(collections.OrderedDict((arg, None) for arg in args).keys())
+            if not args:
+                break
+            before_names = set(self.package_graph["visited"].keys())
+            self.resolve_pkgs(args)
+            new_names = set(self.package_graph["visited"].keys()) - before_names
+            if not new_names:
+                break
+
+    def resolve_pending_candidate_env(self, ext_env):
+        platform_info = Config.Platform()
+        env_pkgs = self.combine_argv([{ext_env: self.resolve_argv(ext_env)}])
+        for name, cons in env_pkgs.items():
+            if name in platform_info:
+                if self.resolve_architecture(name, cons, platform_info):
+                    return True
+                continue
+            if name in self.package_graph["visited"]:
+                tags_list = self.package_graph["visited"][name]
+                for c in cons:
+                    tags_list = self.resolve_tags(c[0], c[1], tags_list)
+                if tags_list:
+                    return True
+        return False
 
     def process_pkgs(self, args, syncer=True):
         self.solution = None
@@ -914,16 +1103,29 @@ class Require(Acquire):
         if syncer:
             self.load_syncer()
         self.resolve_pkgs(args)
+        self.resolve_pending_candidates()
         self.build_filter()
         for name in self.package_state["init"]:
-            if name not in self.package_graph["visited"]:
-                Config.Msg.error("RESOLVE_ERROR", name)
-            if not self.package_graph["visited"][name]:
+            if name not in self.package_graph["visited"] or not self.package_graph["visited"][name]:
+                diagnostics = getattr(getattr(self, "solver", None), "diagnostics", None)
+                if diagnostics:
+                    available = self.package_state.get("available", {}).get(name, [])
+                    if available:
+                        diagnostics.candidate_versions[name] = list(available)
+                    diagnostics.add_entry_failure(
+                        name,
+                        [],
+                        "No candidate versions found for this requested package.",
+                    )
+                self.emit_solver_diagnostics()
                 Config.Msg.error("RESOLVE_ERROR", name)
         names = self.package_state["init"]
         self.solution = self.solver.collect_solution(names)
         if not self.solution:
+            self.emit_solver_diagnostics()
             Config.Msg.error("RESOLVE_ERROR", names)
+        # Emit downgrade warnings on success path (before resolve_pending resets diagnostics)
+        self._emit_downgrade_warnings()
         sub_solution = self.resolve_pending(self.solution)
         self.solution = {**sub_solution, **self.solution}
         return self.solution
@@ -993,14 +1195,16 @@ def main():
     start_time = time.time()
     argv_list = sys.argv[1:]
     command = os.environ.get("SHELL")
-    if not Environ(Config.Env.OFFLINE_MODE).getenv():
-        Environ(Config.Env.OFFLINE_MODE).setenv("0")
-    if not Environ(Config.Env.DEVELOP_MODE).getenv():
-        Environ(Config.Env.DEVELOP_MODE).setenv("0")
-    if not Environ(Config.Env.INHERIT_MODE).getenv():
-        Environ(Config.Env.INHERIT_MODE).setenv("0")
-    if not Environ(Config.Env.PACKAGE_PATH).getenv():
-        Environ(Config.Env.PACKAGE_PATH).setenv(os.path.join(os.path.expanduser("~"), ".packages"))
+    defaults = {
+        Config.Env.OFFLINE_MODE: "0",
+        Config.Env.DEVELOP_MODE: "0",
+        Config.Env.INHERIT_MODE: "0",
+        Config.Env.PACKAGE_TAGS: "10",
+        Config.Env.PACKAGE_PATH: os.path.join(os.path.expanduser("~"), ".packages"),
+    }
+    for env_name, default_value in defaults.items():
+        if not Environ(env_name).getenv():
+            Environ(env_name).setenv(default_value)
     develop_path = Environ(Config.Env.DEVELOP_PATH).getenv()
     if develop_path:
         if Environ(Config.Env.DEVELOP_MODE).getenv() == "0":
