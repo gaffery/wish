@@ -124,6 +124,7 @@ class Config(object):
                 "code": 6,
                 "message": (
                     "Error: Failed to auto-activate extension package '{}'\n"
+                    "Requested by main package(s): {}\n"
                     "The extension package could not be resolved or its activation conditions were not met.\n"
                     "Please check if the extension conditions or the main package environment are correct.\n"
                     "Extension request info:\n{}\n"
@@ -947,8 +948,13 @@ class Require(Acquire):
 
             args = list()
             enas = collections.OrderedDict()
+            # Track which main package requested each extension package (only after condition check)
+            ext_to_main_pkg = {}
+            # Also track main package name for each pending_key
+            pending_key_to_main = {}
             for pending_key in filter_pending:
-                _, _, argv = pending_key
+                main_pkg_name, _, argv = pending_key
+                pending_key_to_main[pending_key] = main_pkg_name
                 if "@" in argv:
                     argv, enav = argv.split("@", 1)
                     if enas.get(argv) is None:
@@ -958,10 +964,17 @@ class Require(Acquire):
                     ext_name = self.resolve_argv(argv)[0]
                     if ext_name not in pending_solution:
                         args.append(argv)
+                    # Record unconditional extension immediately
+                    if ext_name not in ext_to_main_pkg:
+                        ext_to_main_pkg[ext_name] = []
+                    if main_pkg_name not in ext_to_main_pkg[ext_name]:
+                        ext_to_main_pkg[ext_name].append(main_pkg_name)
                     processed_pending.add(pending_key)
 
             platform_info = Config.Platform()
-            for ext_name, ext_env in enas.items():
+            for ext_argv, ext_env in enas.items():
+                # Resolve the actual package name from the argv spec
+                ext_name = self.resolve_argv(ext_argv)[0]
                 ext_conditions = [enav for enav, _ in ext_env]
                 env_pkgs = self.combine_argv([{argv: self.resolve_argv(argv)} for argv in ext_conditions])
                 activate_ext = False
@@ -987,9 +1000,15 @@ class Require(Acquire):
                 if activate_ext:
                     if ext_name not in pending_solution:
                         args.append(ext_name)
+                    # Only record the main packages whose conditions were satisfied
+                    # Use the resolved package name (ext_name) as the key
+                    if ext_name not in ext_to_main_pkg:
+                        ext_to_main_pkg[ext_name] = []
                     for _, pending_key in ext_env:
+                        main_pkg_name = pending_key_to_main[pending_key]
+                        if main_pkg_name not in ext_to_main_pkg[ext_name]:
+                            ext_to_main_pkg[ext_name].append(main_pkg_name)
                         processed_pending.add(pending_key)
-
             args = list(collections.OrderedDict((arg, None) for arg in args).keys())
             if not args:
                 break
@@ -1001,9 +1020,15 @@ class Require(Acquire):
             names = list(pkgs.keys())
             for name in names:
                 if name not in self.package_graph["visited"]:
-                    Config.Msg.error("PENDING_ERROR", name, pkgs.get(name))
+                    # Get the main package(s) that requested this extension
+                    requesting_pkgs = ext_to_main_pkg.get(name, [])
+                    requesting_info = ", ".join(requesting_pkgs) if requesting_pkgs else "unknown"
+                    Config.Msg.error("PENDING_ERROR", name, requesting_info, pkgs.get(name))
                 if not self.package_graph["visited"][name]:
-                    Config.Msg.error("PENDING_ERROR", name, pkgs.get(name))
+                    # Get the main package(s) that requested this extension
+                    requesting_pkgs = ext_to_main_pkg.get(name, [])
+                    requesting_info = ", ".join(requesting_pkgs) if requesting_pkgs else "unknown"
+                    Config.Msg.error("PENDING_ERROR", name, requesting_info, pkgs.get(name))
             self.build_filter(new_visited_names)
             # Lock main solution versions in visited so sub-solve respects them
             saved_visited = {}
@@ -1217,6 +1242,8 @@ def main():
         num = argv_list.index(Config.VERBOSE) + 1
         command_list = argv_list[num:]
         command_argv = argv_list[: argv_list.index(Config.VERBOSE)]
+    else:
+        command_argv = argv_list
     if Config.VERBOSE == "+":
         sys.stdout.write("Execute: wish {}\n".format((" ").join(argv_list)))
         sys.stdout.flush()
@@ -1226,6 +1253,8 @@ def main():
         sys.stdout.flush()
     Nickname.replace(command_list)
     command = (" ").join(command_list)
+    #if not (command or mark_info):
+    #    command = os.environ.get("SHELL")
     exit_code = os.system(command)
     if os.name == "nt":
         sys.exit(exit_code)
